@@ -114,11 +114,13 @@ class FakeSync:
 class RecordingManager:
     """Drops in for engine.LiveTradeManager so adoption can be observed without
     any real order/protection API call.  start_trade/manage_live_trade/dispose
-    record the SAME calls the real manager performs."""
+    record the SAME calls the real manager performs, while _execute_action is
+    the canonical test seam for manual FORCE_EXIT management."""
 
     started = []
     managed = 0
     disposed = []
+    action_calls = []
 
     def __init__(self, *a, **k):
         pass
@@ -128,6 +130,7 @@ class RecordingManager:
         cls.started = []
         cls.managed = 0
         cls.disposed = []
+        cls.action_calls = []
 
     def start_trade(self, symbol, side, entry_price, qty, sl, tp1, tp2, trade_id=None):
         self.__class__.started.append({"symbol": symbol, "side": side,
@@ -136,6 +139,19 @@ class RecordingManager:
 
     def manage_live_trade(self):
         self.__class__.managed += 1
+
+    def _execute_action(self, action, **kwargs):
+        self.__class__.action_calls.append((str(action).upper(), dict(kwargs)))
+        if str(action).upper() == "FORCE_EXIT":
+            # Test-only seam: the production PortfolioManager calls only the
+            # manager action boundary; this fake models a verified force exit.
+            real_close = E.close_position_full
+            try:
+                E.close_position_full = lambda: E.STATE.__setitem__("open", False) or True
+                return bool(E.close_position_full())
+            finally:
+                E.close_position_full = real_close
+        return True
 
     def dispose(self):
         self.__class__.disposed.append(1)
@@ -370,12 +386,8 @@ class ManualAdoptionTest(unittest.TestCase):
             self.assertIn(key[1], ("BUY", "SELL"))
         # Per-leg close removes exactly the requested side.  The venue-close
         # itself is simulated (real close_position_full needs live markets).
-        real_close = E.close_position_full
-        E.close_position_full = lambda: E.STATE.__setitem__("open", False)
-        try:
-            self.assertTrue(self.pm.close_symbol("BTC/USDT:USDT", "BUY"))
-        finally:
-            E.close_position_full = real_close
+        self.assertTrue(self.pm.close_symbol("BTC/USDT:USDT", "BUY"))
+        self.assertEqual(RecordingManager.action_calls[0][0], "FORCE_EXIT")
         self.assertEqual(self.pm.count(), 1)
         self.assertIn(("BTC/USDT:USDT", "SELL"), self.pm.contexts)
 

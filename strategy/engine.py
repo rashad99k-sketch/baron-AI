@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 import core.engine as E
+from core.institutional_evidence import analyze_institutional_evidence
 
 
 class StrategyEngine:
@@ -24,6 +25,7 @@ class StrategyEngine:
         intent_score, intent_status, intent_details = E.InstitutionalIntentEngine.detect(
             df, orderbook, symbol
         )
+        institutional_evidence = analyze_institutional_evidence(df, side, atr=atr)
 
         # Preserve the existing institutional sequence:
         # liquidity -> structure -> zone/retest -> volume/flow -> confirmation.
@@ -34,6 +36,10 @@ class StrategyEngine:
             score += 1.0
         score -= float(smart.get("distribution_risk", 0.0)) / 25.0
         score -= float(momentum.get("exhaustion_risk", 0.0)) / 30.0
+        if institutional_evidence.get("available"):
+            # Bounded evidence contribution: the institutional evidence layer
+            # can improve ranking, but it cannot manufacture a trade decision.
+            score += (float(institutional_evidence.get("confluence_score", 0.0)) - 50.0) / 40.0
 
         scenario = E.detect_scenario(df)
         return {
@@ -50,6 +56,7 @@ class StrategyEngine:
             "smart_money": smart,
             "momentum": momentum,
             "scenario": scenario,
+            "institutional_evidence": institutional_evidence,
         }
 
     def entry_plan(self, analysis: Dict[str, Any]) -> Dict[str, Any]:

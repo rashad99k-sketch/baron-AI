@@ -215,14 +215,21 @@ class Decision2PartialIsInternalOnlyTest(unittest.TestCase):
         self._old_perf = E.PERF
         self._old_send = E.send_once
         self._old_paper = E.PAPER_MODE
+        self._old_live_manager = E._live_manager
         self._old_state = copy.deepcopy(E.STATE)
         self._old_trade_state = copy.deepcopy(E.TRADE_STATE)
+        # Keep the compatibility profit adapter bound to a manager owned by
+        # this test instance. Other portfolio/adoption tests replace the module
+        # singleton during their isolated exercises; without this reset a
+        # single-process pytest run can route TP1 to an unrelated test double.
+        E._live_manager = E.LiveTradeManager(E._event_bus, E._exchange_sync, E._recovery_guard)
 
     def tearDown(self):
         E.GLOBAL_TRADE_OUTCOME_MEMORY = self._old_mem
         E.PERF = self._old_perf
         E.send_once = self._old_send
         E.PAPER_MODE = self._old_paper
+        E._live_manager = self._old_live_manager
         E.STATE.clear()
         E.STATE.update(copy.deepcopy(self._old_state))
         E.TRADE_STATE.clear()

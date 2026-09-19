@@ -1,0 +1,25 @@
+# Render blueprint — BARON (RF Liquidity Pro) production web service.
+# Start command is the deterministic production entrypoint (main.py -> app.bootstrap.run()).
+# The Flask dashboard binds 0.0.0.0:${PORT}; PORT is injected by Render automatically.
+services:
+  - type: web
+    name: baron
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements-runtime.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: PAPER_MODE
+        value: "True"
+      # Secrets and tunables: set via the Render dashboard / service env.
+      # Required for LIVE trading (never commit real values):
+      # - BINGX_KEY
+      # - BINGX_SECRET
+      # - TELEGRAM_BOT_TOKEN
+      # - TELEGRAM_CHAT_ID
+      # Keep PAPER_MODE=True unless you have configured ENABLE_NATIVE_PROTECTION=1
+      # and REQUIRE_NATIVE_PROTECTION_LIVE=1 with valid exchange credentials.

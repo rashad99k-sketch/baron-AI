@@ -18,19 +18,14 @@ if not exist ".venv\Scripts\python.exe" (
 
 call ".venv\Scripts\activate.bat"
 
-echo [SETUP] Checking runtime dependencies...
-python -c "import ccxt,pandas,numpy,flask,requests,dotenv" >nul 2>&1
+echo [SETUP] Checking runtime + release-test dependencies...
+python tools\bootstrap_dependencies.py --dev
 if errorlevel 1 (
-  echo [SETUP] Missing dependency detected. Installing requirements...
-  python -m pip install -r requirements.txt
-  if errorlevel 1 (
-    echo [ERROR] Dependency installation failed.
-    echo Check internet access and requirements.txt.
-    pause
-    exit /b 1
-  )
-) else (
-  echo [SETUP] Dependencies already installed.
+  echo [ERROR] Dependency bootstrap failed.
+  echo The installer retries runtime packages and pytest with clean-cache recovery.
+  echo Check the network/proxy/antivirus and run this launcher again.
+  pause
+  exit /b 1
 )
 
 if not exist ".env" (

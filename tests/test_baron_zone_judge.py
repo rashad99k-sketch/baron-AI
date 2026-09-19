@@ -426,12 +426,13 @@ class TestFailClosedBarrier(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if cls._DOWNLOAD_DIR not in sys.path:
-            sys.path.insert(0, cls._DOWNLOAD_DIR)
-        cls.roro = sys.modules.get("roro")
+        # Historical test depended on a machine-local roro.py. BARON's current
+        # canonical execution kernel is core.engine; bind the test to it so the
+        # release suite is portable and deterministic.
+        cls.roro = sys.modules.get("core.engine")
         if cls.roro is None:
-            import importlib
-            cls.roro = importlib.import_module("roro")
+            import core.engine as roro
+            cls.roro = roro
         cls._env_backup = None
 
     def setUp(self):

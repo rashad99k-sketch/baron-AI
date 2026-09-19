@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os
 import signal
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -9,6 +10,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = sorted((ROOT / "tests").glob("test_*.py"))
 failed: list[str] = []
+if importlib.util.find_spec("pytest") is None:
+    print("RELEASE GATE BLOCKED: pytest is not installed in the active Python environment.", flush=True)
+    print("Run: python tools\bootstrap_dependencies.py --dev", flush=True)
+    raise SystemExit(2)
 passed_files = 0
 TIMEOUT_SECONDS = int(os.getenv("BARON_TEST_TIMEOUT", "60"))
 

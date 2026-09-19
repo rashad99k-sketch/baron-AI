@@ -27,8 +27,8 @@ class PositionContext:
 
 class PortfolioManager:
     def __init__(self, max_positions: int = 6, engine=None):
-        self.max_positions = max(1, int(max_positions))
-        self.max_technical_positions = max(1, min(self.max_positions, int(os.getenv("MAX_TECHNICAL_POSITIONS", "5"))))
+        self.max_positions = 6
+        self.max_technical_positions = 5
         self.engine = engine
         self.contexts: Dict[str, PositionContext] = {}
         self.active_symbol: Optional[str] = None
@@ -97,48 +97,14 @@ class PortfolioManager:
 
     @staticmethod
     def _asset_class(symbol: str, explicit: str | None = None) -> str:
+        """Single-source asset classification; never infer CRYPTO from USDT."""
         if explicit:
             return str(explicit).upper()
-        text = str(symbol or "").upper()
-        # Canonical tradfi prefix classification (single source of truth:
-        # scanner.universe.classify): NCSK->STOCK, NCSI->INDEX, NCCO->
-        # GOLD/OIL/METAL/ENERGY, NCFX->FOREX. Only metadata-confidence prefix
-        # hits are routed through the canonical classifier, EXCEPT the NCFX
-        # forex prefix: those symbols classify as FOREX via the venue's
-        # currency-pair pattern (universe returns ("FOREX","pattern",0.55)),
-        # and FOREX is a permanently unsupported bucket (cap 0, fail-closed),
-        # so a pattern-classified FOREX is accepted for the NCFX prefix to keep
-        # the manager's class consistent with the universe/allocator. Every
-        # other symbol keeps the legacy hint behaviour below so CRYPTO remains
-        # the safe fallback.
-        if text.split("/")[0].startswith(("NCSI", "NCSK", "NCCO", "NCFX")):
-            try:
-                from scanner.universe import classify
-                _ac, _src, _conf = classify(str(symbol or ""), {})
-                if _src == "metadata" and _ac:
-                    return _ac
-                if text.split("/")[0].startswith("NCFX") and _ac == "FOREX":
-                    return _ac
-            except Exception:
-                pass
-        if any(x in text for x in ("XAU", "GOLD")):
-            return "GOLD"
-        if any(x in text for x in ("WTI", "BRENT", "OIL", "CRUDE")):
-            return "OIL"
-        if any(x in text for x in ("SP500", "US500", "NASDAQ", "USTECH", "US30", "DAX", "FTSE", "CAC", "NIKKEI", "INDEX")):
-            return "INDEX"
-        stock_hints = {"AAPL", "AMZN", "GOOGL", "MSFT", "NVDA", "META", "TSLA", "JPM", "ARM", "INTC", "CRCL", "COIN", "PLTR"}
-        base = text.replace(":USDT", "").replace("/USDT", "").replace("-USDT", "")
-        if base in stock_hints:
-            return "STOCK"
-        # FAIL-CLOSED tail: CRYPTO is ONLY ever assigned to a venue-shaped
-        # margin pair (USDT/USDC quote present). A TradFi/unknown shape with no
-        # exchange-grounded evidence stays UNKNOWN — it can never silently
-        # become CRYPTO (that was the legacy fallback that put stock/ETF/forex
-        # instruments into the crypto bucket and consumed its capacity).
-        if "USDT" in text or "USDC" in text:
-            return "CRYPTO"
-        return "UNKNOWN"
+        try:
+            from scanner.universe import classify
+            return str(classify(str(symbol or ""), {})[0] or "UNKNOWN").upper()
+        except Exception:
+            return "UNKNOWN"
 
     @staticmethod
     def _class_cap(cls: str) -> int:
@@ -171,14 +137,7 @@ class PortfolioManager:
         (e.g. the NEWS slot on a symbol whose name would classify as CRYPTO),
         falling back to symbol derivation for legacy contexts."""
         stored = getattr(pos, "asset_class", None)
-        if stored:
-            return stored
-        derived = self._asset_class(pos.symbol)
-        # Legacy contexts carry no stored class. A non-derivable symbol (no
-        # venue pair shape, no TradFi family/hint) was opened under the legacy
-        # CRYPTO-default regime, so it counts against the CRYPTO bucket —
-        # capacity must never be leaked by an UNKNOWN class (which has no seat).
-        return derived if derived != "UNKNOWN" else "CRYPTO"
+        return stored if stored else self._asset_class(pos.symbol)
 
     def can_open(self, symbol: str, asset_class: str | None = None) -> bool:
         with self._lock:
@@ -558,26 +517,6 @@ class PortfolioManager:
         qty = float(item.get("contracts", 0) or 0)
         entry = float(item.get("entryPrice", 0) or 0)
         side = str(item.get("side", "BUY") or "BUY").upper()
-        # Idempotency guard: never re-adopt a physical position whose close has
-        # already been announced (durable Telegram dedup ledger). Re-adoption
-        # would mint a fresh REC-{symbol}-{side}-{millis} id and re-enter the
-        # management loop, re-sending "TRADE CLOSED" telegrams for the SAME
-        # physical position under changing ids. Identity is venue-attribute
-        # based (symbol|side|entry|qty_initial), NOT the local trade_id.
-        if self.engine is not None and callable(getattr(self.engine, "_is_close_announced", None)):
-            try:
-                _probe_qty = qty
-                if _probe_qty <= 0:
-                    _probe_qty = float(item.get("qty", 0) or 0)
-                if _probe_qty > 0:
-                    _id_key = self.engine._close_identity_key(symbol, side, entry, _probe_qty)
-                    if self.engine._is_close_announced(_id_key):
-                        self.engine.log_execution(
-                            f"[RECOVERY] {symbol} {side} physical position was already announced CLOSED (identity {_id_key}); skipping re-adoption to prevent duplicate close notifications",
-                            "WARN", debounce_key=f"skip_readopt_{_id_key}", debounce_sec=60)
-                        return False
-            except Exception:
-                pass
         if side not in ("BUY", "SELL"):
             side = "BUY"
         if not symbol or qty <= 0 or entry <= 0:
@@ -638,6 +577,10 @@ class PortfolioManager:
             self.engine.TRADE_STATE.update({"in_position": True, "symbol": symbol, "side": side, "entry": entry, "qty": qty, "last_update_ts": time.time()})
             self.engine._live_manager.start_trade(symbol, side, entry, qty, sl, tp1, tp2, self.engine.STATE["trade_id"])
             self._store_after_open(symbol, self.engine._live_manager, None, key=key)
+            try:
+                self.engine._partition_begin_active_trade()
+            except Exception:
+                pass
             self.engine.log_execution(f"[RECOVERY] Adopted {symbol} {side} qty={qty:.6f} entry={entry:.6f} trade_id={self.engine.STATE['trade_id']}", "SUCCESS")
             return True
         finally:
@@ -657,6 +600,10 @@ class PortfolioManager:
                     continue
                 self.engine.sync_position_state(symbol)
                 if self.engine.STATE.get("open"):
+                    # Forensics observes the live state before management mutates
+                    # any levels. It is measurement-only and never gates the trade.
+                    self.engine._partition_begin_active_trade()
+                    self.engine._partition_observe_active_trade(force=False)
                     self.engine._live_manager.manage_live_trade()
                 # Exit decisions belong exclusively to LiveTradeManager.
                 # council_exit is a legacy signal provider and must not be
@@ -770,10 +717,18 @@ class PortfolioManager:
             return False
         closed = False
         for key in keys:
+            ctx = self.contexts.get(key)
             self.activate(key)
             try:
                 if self.engine.STATE.get("open"):
-                    self.engine.close_position_full()
+                    manager = getattr(ctx, "live_manager", None)
+                    if manager is None or not hasattr(manager, "_execute_action"):
+                        self._capture()
+                        continue
+                    manager._execute_action(
+                        "FORCE_EXIT", reason="PORTFOLIO_CLOSE_SYMBOL",
+                        stage="PORTFOLIO_CLOSE",
+                    )
                 done = not self.engine.STATE.get("open")
                 if done:
                     ctx = self.contexts.pop(key, None)

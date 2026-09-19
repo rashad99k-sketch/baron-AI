@@ -19,6 +19,11 @@ from news.service import NewsService, news_state_for_side
 from strategy.engine import StrategyEngine
 from scanner.universe import build_balanced, classify
 try:
+    from core.decision_path_telemetry import emit as emit_decision_path, market_snapshot as decision_market_snapshot
+except Exception:
+    emit_decision_path = None
+    decision_market_snapshot = None
+try:
     from core.early_discovery import analyze_formation, classify_move_maturity
 except Exception:
     analyze_formation = None
@@ -27,6 +32,10 @@ try:
     from core.vpa import analyze_vpa
 except Exception:
     analyze_vpa = None
+try:
+    from core.institutional_fusion import build_institutional_fusion
+except Exception:
+    build_institutional_fusion = None
 
 # MSB-OB is a hard dependency of this module; isolation-safe import keeps
 # teardown-order flakiness from previous test sessions from killing the
@@ -881,10 +890,9 @@ class DeepScanner:
 
     def _analyze_symbol(self, entry: dict) -> dict | None:
         sym = entry["symbol"]
-        # FAIL-CLOSED: a missing watch asset_class must derive from the
-        # authoritative resolver (UNKNOWN for metadata-free shapes) — never the
-        # legacy silent "CRYPTO" default that could re-label a TradFi symbol.
-        asset = entry.get("asset_class") or E.AssetBehaviorProfile.resolve_asset_class(sym)
+        trace_id = str(entry.get("_decision_path_id") or f"{sym}:{time.time_ns()}")
+        entry["_decision_path_id"] = trace_id
+        asset = entry.get("asset_class", "CRYPTO")
         try:
             if getattr(E, "SYMBOL_GUARD", None) is not None and E.SYMBOL_GUARD.is_paused(sym):
                 return None
@@ -930,6 +938,19 @@ class DeepScanner:
                     ti = {}
                 analysis["trade_intelligence"] = ti
                 score = float(analysis.get("score", 0.0))
+                if emit_decision_path is not None:
+                    try:
+                        _side_atr = float(E.compute_atr(df).iloc[-1]) if len(df) > 14 else 0.0
+                        _side_snap = decision_market_snapshot(df, side, _side_atr, float(df["close"].iloc[-1])) if decision_market_snapshot else {}
+                        emit_decision_path(
+                            trace_id=trace_id, symbol=sym, side=side, stage="SCANNER_SIDE_HYPOTHESIS",
+                            decision="BUY" if side == "BUY" else "SELL", authority="DISCOVERY_HYPOTHESIS",
+                            source="DeepScanner.strategy.analyze", snapshot=_side_snap,
+                            fields={"strategy_score": score, "narrative": analysis.get("narrative", {}),
+                                    "watchlist_input_side": side},
+                        )
+                    except Exception:
+                        pass
                 if ti:
                     ti_score = float(ti.get("score", 0.0))
                     score += max(0.0, min(2.5, (ti_score - 45.0) / 20.0))
@@ -959,6 +980,21 @@ class DeepScanner:
                 analyses.append(analysis)
 
             best = max(analyses, key=lambda x: float(x.get("watch_score", 0.0)))
+            if emit_decision_path is not None:
+                try:
+                    _best_atr = float(E.compute_atr(df).iloc[-1]) if len(df) > 14 else 0.0
+                    _best_snap = decision_market_snapshot(df, best.get("side", ""), _best_atr, float(df["close"].iloc[-1])) if decision_market_snapshot else {}
+                    emit_decision_path(
+                        trace_id=trace_id, symbol=sym, side=best.get("side", ""), stage="WATCHLIST_DIRECTION_SELECTED",
+                        decision=best.get("side", ""), authority="WATCHLIST_SELECTION", source="DeepScanner",
+                        snapshot=_best_snap,
+                        fields={"buy_watch_score": next((float(a.get("watch_score", 0)) for a in analyses if a.get("side") == "BUY"), None),
+                                "sell_watch_score": next((float(a.get("watch_score", 0)) for a in analyses if a.get("side") == "SELL"), None),
+                                "selected_watch_score": float(best.get("watch_score", 0)),
+                                "selected_narrative": best.get("narrative", {})},
+                    )
+                except Exception:
+                    pass
             trade_intel = best.get("trade_intelligence") or {}
             narrative = best.get("narrative") or {}
             score = float(best.get("watch_score", 0.0))
@@ -1416,10 +1452,35 @@ class DeepScanner:
                 }
             )
 
+            # Build one explainable institutional fingerprint for Scanner/Dashboard.
+            # This is advisory telemetry only and never changes the execution authority.
+            if build_institutional_fusion is not None:
+                try:
+                    entry["institutional_fusion"] = build_institutional_fusion(entry)
+                    entry["explosive_candidate"] = bool(entry["institutional_fusion"].get("explosive_candidate"))
+                    entry["institutional_state"] = entry["institutional_fusion"].get("state", "WATCH")
+                except Exception as _fusion_exc:
+                    entry["institutional_fusion"] = {"advisory_only": True, "state": "UNAVAILABLE", "error": str(_fusion_exc)}
+
             # Immediate dynamic promotion: this is the hand-off the Dashboard
             # represents as INSTITUTIONAL ZONE ANALYSIS — Dynamic Candidates.
             # It runs on the same fresh Watchlist result, so there is no extra
             # 90-second radar wait and no dependency on the old main_loop_sniper.
+            if emit_decision_path is not None:
+                try:
+                    _final_atr = float(E.compute_atr(df).iloc[-1]) if len(df) > 14 else 0.0
+                    _final_snap = decision_market_snapshot(df, best["side"], _final_atr, float(best["price"])) if decision_market_snapshot else {}
+                    emit_decision_path(
+                        trace_id=trace_id, symbol=sym, side=best["side"], stage="INSTITUTIONAL_ANALYSIS",
+                        decision="PASS_TO_PROMOTION", authority="DeepScanner", source="InstitutionalEvidence",
+                        snapshot=_final_snap,
+                        fields={"strength": strength, "score": float(score),
+                                "move_maturity": move_maturity, "precursor_evidence": sorted(precursor_evidence),
+                                "institutional_analysis": institutional_analysis, "zone": zone_payload,
+                                "trade_type": entry.get("trade_type")},
+                    )
+                except Exception:
+                    pass
             self._institutional_bridge(sym, entry, score, precursor_evidence, strength)
             return entry
         except Exception as exc:

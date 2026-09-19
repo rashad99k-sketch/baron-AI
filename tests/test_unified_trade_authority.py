@@ -63,3 +63,34 @@ class UnifiedTradeAuthorityTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_live_manager_has_one_runtime_management_decision_path():
+    source = (ROOT / "core" / "engine.py").read_text(encoding="utf-8")
+    start = source.index("def _apply_management(self, symbol, now):")
+    end = source.index("_event_bus = EventBus()", start)
+    block = source[start:end]
+    assert "self.brain.evaluate(" in block
+    assert "apply_50_50_profit_engine(" not in block
+    assert "apply_profit_engine(" not in block
+    assert "_apply_dynamic_profit_and_exit_rules(" not in block
+
+
+def test_canonical_market_state_prevents_stale_range_chop_management_label():
+    from core.unified_trade_management_brain import UnifiedTradeManagementBrain
+    brain = UnifiedTradeManagementBrain()
+    state = brain.update({}, {}, 53.7, "RANGE_CHOP", market_state={"state": "MARKUP"})
+    assert state == "EXPANSION"
+    assert brain.get_patience_level() == "HIGH"
+
+
+def test_brain_prioritizes_canonical_tp_before_secondary_protection():
+    from core.unified_trade_management_brain import UnifiedTradeManagementBrain
+    brain = UnifiedTradeManagementBrain()
+    d = brain.evaluate({
+        "side": "BUY", "entry": 100.0, "roe": 5.0, "roe_valid": True,
+        "tp1_hit": False, "tp1_touched": True, "tp2_touched": False,
+        "pre_tp1_protect": True, "be_needed": True,
+    })
+    assert d.action == "TP1"
+    assert d.stage == "TP1"

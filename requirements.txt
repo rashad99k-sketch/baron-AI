@@ -1,7 +1,2 @@
-ccxt
-pandas
-numpy
-Flask
-requests
-python-dotenv
-pytest
+-r requirements-runtime.txt
+-r requirements-dev.txt

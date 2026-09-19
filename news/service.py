@@ -36,6 +36,12 @@ class NewsAssessment:
     provider: str = "NONE"
     direct_count: int = 0
     macro_event: bool = False
+    status: str = "NO_DATA"
+    freshness_state: str = "UNKNOWN"
+    source_reliability: str = "UNKNOWN"
+    entity: str = ""
+    catalyst_types: List[str] = field(default_factory=list)
+    reaction_state: str = "NO_DATA"
 
     def as_dict(self):
         return {
@@ -49,6 +55,12 @@ class NewsAssessment:
             "symbol_risk": round(float(self.symbol_risk), 1),
             "direct_count": int(self.direct_count),
             "macro_event": bool(self.macro_event),
+            "status": self.status,
+            "freshness_state": self.freshness_state,
+            "source_reliability": self.source_reliability,
+            "entity": self.entity,
+            "catalyst_types": list(dict.fromkeys(self.catalyst_types or [])),
+            "reaction_state": self.reaction_state,
         }
 
 
@@ -243,6 +255,11 @@ class NewsService:
         causation = "LIKELY_CAUSE" if impact == "HIGH" and ts and (time.time() - ts) <= 3600 else "CONTEXTUAL"
         source_name = source or provider or "Unknown"
         source_quality = 80 if any(k in source_name.lower() for k in ("reuters", "bloomberg", "federal reserve", "cme", "sec")) else 50
+        age_sec = round(max(0.0, time.time()-ts), 1) if ts else None
+        freshness_state = "FRESH" if age_sec is not None and age_sec <= 3600 else (
+            "AGING" if age_sec is not None and age_sec <= 21600 else "STALE"
+        ) if age_sec is not None else "UNKNOWN"
+        reliability = "HIGH" if source_quality >= 75 else "MEDIUM"
         return {
             "title": title,
             "link": link or "",
@@ -258,7 +275,12 @@ class NewsService:
             "impact": impact,
             "causation": causation,
             "source_quality": source_quality,
-            "freshness_sec": round(max(0.0, time.time()-ts), 1) if ts else None,
+            "freshness_sec": age_sec,
+            "freshness_state": freshness_state,
+            "source_reliability": reliability,
+            "entity": self._clean_symbol(title),
+            "catalyst": event_type,
+            "reaction_state": "NO_DATA",
             "sentiment_confidence": round(confidence, 2),
         }
 
@@ -380,7 +402,7 @@ class NewsService:
 
     def assess(self, symbol: str, asset_class: str = "CRYPTO") -> NewsAssessment:
         if not self.enabled:
-            return NewsAssessment(available=False)
+            return NewsAssessment(available=False, status="DATA_UNAVAILABLE", provider="NONE", entity=self._clean_symbol(symbol))
 
         key = f"{asset_class}:{symbol}"
         symbol_news, symbol_provider = self._get_cached(key, self._query(symbol, asset_class))
@@ -396,7 +418,7 @@ class NewsService:
             symbol_news = []
 
         if not symbol_news and not global_news:
-            return NewsAssessment(available=False, provider="NONE")
+            return NewsAssessment(available=False, provider="NONE", status="NO_DATA", entity=self._clean_symbol(symbol))
 
         symbol_risk, symbol_bias = self._score(symbol_news, macro=False)
         macro_risk, macro_bias = self._score(global_news, macro=True)
@@ -408,6 +430,11 @@ class NewsService:
             h["scope"] = "DIRECT" if h in symbol_news else "MACRO"
         provider = symbol_provider if symbol_news else global_provider
         macro_event = any(self.macro_high.search(h.get("title", "")) for h in merged)
+        freshness_values = [str(h.get("freshness_state", "UNKNOWN")).upper() for h in merged]
+        freshness = "FRESH" if "FRESH" in freshness_values else ("AGING" if "AGING" in freshness_values else "STALE")
+        rel_values = [str(h.get("source_reliability", "UNKNOWN")).upper() for h in merged]
+        reliability = "HIGH" if "HIGH" in rel_values else ("MEDIUM" if "MEDIUM" in rel_values else "UNKNOWN")
+        status = "CONFIRMED_EVENT" if symbol_news else ("LOW_CONFIDENCE" if global_news else "NO_DATA")
         return NewsAssessment(
             risk=risk,
             bias=bias,
@@ -419,6 +446,12 @@ class NewsService:
             provider=provider,
             direct_count=len(symbol_news),
             macro_event=macro_event,
+            status=status,
+            freshness_state=freshness,
+            source_reliability=reliability,
+            entity=self._clean_symbol(symbol),
+            catalyst_types=[h.get("catalyst", h.get("event_type", "MARKET")) for h in merged],
+            reaction_state="UNVERIFIED",
         )
 
 
@@ -432,8 +465,15 @@ def news_state_for_side(assessment: "NewsAssessment", side: str,
       - bias aligned with side -> NEWS_SUPPORT, opposed -> NEWS_CONFLICT
       - otherwise -> NEWS_NEUTRAL
     """
-    if assessment is None or not getattr(assessment, "available", False):
+    if assessment is None:
+        return "NO_DATA"
+    if not getattr(assessment, "available", False):
+        # Keep the underlying assessment status explicit (NO_DATA,
+        # DATA_UNAVAILABLE, PROVIDER_FAILURE, etc.) while preserving the
+        # historical side-level contract used by the decision layer.
         return "NEWS_UNAVAILABLE"
+    if str(getattr(assessment, "freshness_state", "FRESH")).upper() == "STALE":
+        return "STALE"
     if float(getattr(assessment, "risk", 0.0) or 0.0) >= risk_block:
         return "NEWS_RISK"
     # A directional claim requires direct instrument news or a real macro event;

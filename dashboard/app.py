@@ -327,6 +327,15 @@ def dashboard():
         <div class="card">Continuation Pressure<div id="cont_pressure">-</div></div>
         <div class="card">Thesis Failure Score<div id="thesis_failure">-</div></div>
       </div>
+      <div class="grid" style="grid-template-columns: repeat(6,1fr); margin-top:8px;">
+        <div class="card">MARKET STATE<div id="ms-state">-</div></div>
+        <div class="card">EMA50 / EMA200<div id="ms-ema">-</div></div>
+        <div class="card">VWAP VALUE<div id="ms-vwap">-</div></div>
+        <div class="card">ACCUMULATION<div id="ms-acc">-</div></div>
+        <div class="card">DISTRIBUTION<div id="ms-dist">-</div></div>
+        <div class="card">MICROSTRUCTURE<div id="ms-micro">-</div></div>
+      </div>
+      <div id="ms-reasons" class="card" style="margin-top:8px;font-size:12px;">Market-state evidence: -</div>
     </div>
     """
     
@@ -481,6 +490,38 @@ def dashboard():
     """
     
     supervisor_panel_html = render_live_supervisor_panel()
+
+    ai_learning_panel_html = """
+    <div class="section ai-learning-panel">
+      <div class="ai-head">
+        <div>
+          <div class="ai-kicker">BARON ADAPTIVE INTELLIGENCE</div>
+          <div class="title ai-title">🧠 AI Trade Coach — Learn From Winners, Diagnose Weak Entries</div>
+          <div class="ai-subtitle">Outcome memory + setup fingerprint learning. Advisory only — it never changes live rules by itself.</div>
+        </div>
+        <div id="ai-status" class="ai-badge">LEARNING</div>
+      </div>
+      <div class="ai-grid">
+        <div class="ai-card"><div class="ai-label">Recorded Trades</div><div id="ai-total" class="ai-value">0</div></div>
+        <div class="ai-card"><div class="ai-label">Strong / Explosive</div><div id="ai-strong" class="ai-value">0</div></div>
+        <div class="ai-card"><div class="ai-label">Explosive Rate</div><div id="ai-explosive" class="ai-value">0%</div></div>
+        <div class="ai-card"><div class="ai-label">Avg Peak ROE</div><div id="ai-peak" class="ai-value">0%</div></div>
+        <div class="ai-card"><div class="ai-label">Avg Realized</div><div id="ai-realized" class="ai-value">0%</div></div>
+      </div>
+      <div class="ai-columns">
+        <div class="ai-box"><div class="ai-box-title">LIVE SETUP DIAGNOSIS</div><div id="ai-live-diagnosis" class="ai-diagnosis">No open setup.</div></div>
+        <div class="ai-box"><div class="ai-box-title">LEARNED EXPLOSIVE PATTERNS</div><div id="ai-playbook" class="ai-list">Building the playbook…</div></div>
+      </div>
+      <div class="ai-box"><div class="ai-box-title">RECENT TRADE LESSONS</div><div id="ai-recent" class="ai-list">Loading…</div></div>
+    </div>
+    <style>
+      .ai-learning-panel{background:linear-gradient(145deg,#0b1220,#090d15);border:1px solid #263449;border-radius:16px;margin:14px;padding:16px;box-shadow:0 12px 30px rgba(0,0,0,.22)}
+      .ai-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;border-bottom:1px solid #243044;padding-bottom:12px}.ai-kicker{font-size:10px;letter-spacing:1.8px;color:#7dd3fc;font-weight:800}.ai-title{font-size:18px!important;color:#e5f7ff!important;margin-top:4px}.ai-subtitle{font-size:11px;color:#8fa0b5;margin-top:4px}.ai-badge{padding:7px 12px;border-radius:999px;border:1px solid #2563eb;background:#0b1c3d;color:#93c5fd;font-size:11px;font-weight:800;white-space:nowrap}
+      .ai-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:9px;margin:13px 0}.ai-card{background:#111a28;border:1px solid #1f2b3d;border-radius:12px;padding:10px}.ai-label{font-size:10px;color:#8494a8;text-transform:uppercase}.ai-value{font-size:19px;font-weight:800;color:#e8f2ff;margin-top:4px}
+      .ai-columns{display:grid;grid-template-columns:1fr 1.4fr;gap:10px;margin-bottom:10px}.ai-box{background:#0e1623;border:1px solid #1d2a3b;border-radius:12px;padding:11px}.ai-box-title{font-size:10px;letter-spacing:1px;color:#7f91a7;font-weight:800;margin-bottom:8px}.ai-diagnosis{font-size:12px;line-height:1.65;color:#d7e1ed}.ai-list{max-height:230px;overflow:auto;font-size:11px;color:#cbd5e1}.ai-row{padding:8px 0;border-bottom:1px solid #1b2635}.ai-row:last-child{border-bottom:0}.ai-tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:2px 7px;margin-right:5px;font-size:9px}.ai-strong{color:#86efac}.ai-weak{color:#fca5a5}.ai-neutral{color:#fcd34d}
+      @media(max-width:900px){.ai-grid{grid-template-columns:repeat(2,1fr)}.ai-columns{grid-template-columns:1fr}}
+    </style>
+    """
     
     html = f"""
 <!DOCTYPE html>
@@ -518,6 +559,7 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 {intent_panel_html}
 {dynamic_trade_panel_html}
 {flow_section_html}
+{ai_learning_panel_html}
 {continuation_panel_html}
 {thesis_panel_html}
 {confidence_regime_panel}
@@ -550,6 +592,9 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 </div>
 <div class="section smart-layer"><div class="title">🛰️ DEEP INSTITUTIONAL RADAR</div>
 <div id="deepRadar" class="card">No radar data</div>
+</div>
+<div class="section smart-layer"><div class="title">🏦 INSTITUTIONAL SETUP RADAR</div>
+<div id="institutionalSetupRadar" class="card">Loading institutional evidence...</div>
 </div>
 <div class="section smart-layer"><div class="title">📡 TOP RF OPPORTUNITIES</div>
 <div id="top5" class="card"></div>
@@ -591,6 +636,7 @@ async function fetchData() {{
     try {{
         const r = await fetch('/data');
         const d = await r.json();
+        window.__baronData = d;
         cachedData = d;
         updateUI(d);
     }} catch(e) {{ console.error(e); }}
@@ -767,6 +813,16 @@ function updateUI(d) {{
     document.getElementById("market_regime").innerHTML = d.market_regime || "UNKNOWN";
     document.getElementById("cont_pressure").innerHTML = d.continuation_pressure || 50;
     document.getElementById("thesis_failure").innerHTML = d.thesis_failure_score || 0;
+    const ms = d.market_state || {{}};
+    const me = ms.ema || {{}}; const mv = ms.vwap || {{}};
+    const ma = ms.accumulation || {{}}; const md = ms.distribution || {{}}; const mm = ms.microstructure || {{}};
+    document.getElementById("ms-state").innerText = `${{ms.state || "UNKNOWN"}} · ${{ms.transition_state || "UNKNOWN"}}`;
+    document.getElementById("ms-ema").innerText = `${{Number(me.ema50||0).toFixed(4)}} / ${{Number(me.ema200||0).toFixed(4)}} (${{me.cross_state||"-"}})`;
+    document.getElementById("ms-vwap").innerText = `${{mv.side||"-"}} · ${{Number(mv.value||0).toFixed(4)}}`;
+    document.getElementById("ms-acc").innerText = Number(ma.score||0).toFixed(1);
+    document.getElementById("ms-dist").innerText = Number(md.score||0).toFixed(1);
+    document.getElementById("ms-micro").innerText = mm.data_quality === "FRESH" ? `OB ${{mm.top_of_book_imbalance == null ? "-" : Number(mm.top_of_book_imbalance).toFixed(2)}}` : (mm.data_quality || "UNAVAILABLE");
+    document.getElementById("ms-reasons").innerText = `Market-state evidence: ${{(ms.reasons || []).join(" · ") || "-"}} | Data: ${{ms.data_quality || "UNKNOWN"}}`;
     document.getElementById("logs").innerHTML = (d.logs || []).slice(-15).join("<br>");
     document.getElementById("errors").innerHTML = (d.errors || []).slice(-5).join("<br>");
     let top5Html = "";
@@ -1039,6 +1095,35 @@ async function loadDecision() {{
 setInterval(loadDecision, 6000);
 loadDecision();
 fetchData();
+// === BARON ADAPTIVE TRADE INTELLIGENCE ===
+async function loadAdaptiveTradeIntelligence() {{
+  try {{
+    const res = await fetch('/ai-learning', {{cache:'no-store'}});
+    const d = await res.json();
+    const s = d.summary || {{}};
+    const set = (id,v) => {{ const el=document.getElementById(id); if(el) el.innerText=v; }};
+    set('ai-total', s.total_trades || 0); set('ai-strong', s.strong_or_explosive || 0);
+    set('ai-explosive', Number(s.explosive_rate || 0).toFixed(1) + '%');
+    set('ai-peak', Number(s.avg_strong_peak_roe || 0).toFixed(1) + '%');
+    set('ai-realized', Number(s.avg_strong_realized_pct || 0).toFixed(2) + '%');
+    set('ai-status', s.status || 'LEARNING');
+    const assessment = (window.__baronData || {{}}).adaptive_trade_intelligence?.entry_assessment || {{}};
+    const live = document.getElementById('ai-live-diagnosis');
+    if (live) {{
+      if (assessment.label) {{
+        const cls = assessment.label === 'HISTORICALLY_WEAK' ? 'ai-weak' : assessment.label === 'HISTORICALLY_STRONG' ? 'ai-strong' : 'ai-neutral';
+        live.innerHTML = `<span class="ai-tag ${{cls}}">${{assessment.label}}</span> ${{assessment.message || ''}}<br><small>Samples: ${{assessment.samples || 0}} · Confidence: ${{Number(assessment.confidence || 0).toFixed(1)}}% · Advisory only</small>`;
+      }} else live.innerText = 'No historical diagnosis available for the current setup yet.';
+    }}
+    const pb = document.getElementById('ai-playbook');
+    if (pb) pb.innerHTML = (d.playbook || []).map(x => {{ const p=x.pattern||{{}}; return `<div class="ai-row"><span class="ai-tag ai-strong">${{x.explosive_share || 0}}% explosive</span><b>${{p.side||'-'}} · ${{p.ob_grade||'-'}} · ${{p.liquidity_event||'-'}}</b><br><small>${{p.market_regime||'-'}} · ${{p.move_maturity||'-'}} · ${{p.formation_verdict||'-'}} · ${{p.structure_shift||'-'}} · ${{p.vpa_state||'-'}} · Forecast:${{p.forecast_quality||'-'}} · n=${{x.samples}}</small></div>`; }}).join('') || 'Not enough repeated strong setups yet. The system will learn as verified trades accumulate.';
+    const rr = document.getElementById('ai-recent');
+    if (rr) rr.innerHTML = (d.recent || []).slice(0,12).map(x => {{ const cls=String(x.label||'').includes('WIN')?'ai-strong':(String(x.label||'').includes('LOSS')||x.label==='WEAK_ENTRY'?'ai-weak':'ai-neutral'); return `<div class="ai-row"><span class="ai-tag ${{cls}}">${{x.label||'UNKNOWN'}}</span><b>${{x.symbol||'-'}} ${{x.side||''}}</b> · PnL ${{Number(x.pnl_pct||0).toFixed(2)}}% · Peak ROE ${{Number(x.peak_roe||0).toFixed(1)}}%<br><small>${{x.exit_reason||'UNKNOWN'}} · ${{new Date(Number(x.recorded_at||0)*1000).toLocaleString()}}</small></div>`; }}).join('') || 'No completed trades recorded yet.';
+  }} catch(e) {{ console.error('Adaptive intelligence:', e); }}
+}}
+setInterval(loadAdaptiveTradeIntelligence, 6000);
+loadAdaptiveTradeIntelligence();
+
 // === BARON PROFESSIONAL INTELLIGENCE / TRADE LIFECYCLE ===
 async function loadProfessionalPanels() {{
   try {{
@@ -1052,6 +1137,32 @@ async function loadProfessionalPanels() {{
 }}
 setInterval(loadProfessionalPanels, 6000);
 loadProfessionalPanels();
+
+// Institutional Setup Radar: read-only synthesis of the scanner evidence.
+async function loadInstitutionalSetupRadar() {{{{
+  try {{{{
+    const res = await fetch('/intelligence', {{cache:'no-store'}});
+    const d = await res.json();
+    const box = document.getElementById('institutionalSetupRadar');
+    if (!box) return;
+    const items = d.institutional_setups || [];
+    if (!items.length) {{{{ box.innerHTML = 'No institutional setup evidence yet.'; return; }}}}
+    box.innerHTML = items.slice(0,12).map(x => {{{{
+      const f=x.institutional_fusion||{{}};
+      const seq=f.sequence||{{}}; const loc=f.location||{{}}; const z=f.zone||{{}};
+      const state=f.state||'WATCH';
+      const cls=state==='CONFLICTED'?'red':(state==='EARLY_MOVE'||state==='CONFIRMED'?'green':'yellow');
+      const flags=[seq.liquidity_sweep?'SWEEP':'',seq.structure_shift?'MSS/BOS':'',seq.causal_zone?'OB':'',seq.retest?'RETEST':'',seq.vpa_confirmation?'VPA':''].filter(Boolean).join(' · ');
+      return `<div style="padding:9px 0;border-bottom:1px solid #1f2937;">
+        <div><b>${{x.symbol||'-'}}</b> · ${{x.side||'-'}} · <span class="${{cls}}">${{state}}</span> · Evidence ${{Number(f.evidence_score||0).toFixed(0)}}</div>
+        <div style="font-size:11px;color:#9ca3af;margin-top:3px">${{loc.role||'NEUTRAL_LOCATION'}} · OB ${{z.grade||'-'}} · ${{flags||'FORMING'}}</div>
+        <div style="font-size:11px;color:#9ca3af;margin-top:3px">${{f.explosive_candidate?'🔥 EARLY-EXPANSION CANDIDATE · ':''}}${{(f.contradictions||[]).join(' · ')||'No major contradiction'}}</div>
+      </div>`;
+    }}}}).join('');
+  }}}} catch(e) {{{{ console.error('Institutional setup radar:', e); }}}}
+}}}}
+setInterval(loadInstitutionalSetupRadar, 6000);
+loadInstitutionalSetupRadar();
 </script>
 <div style="padding:12px;display:grid;grid-template-columns:1fr 1fr;gap:14px;background:#07090d">
   <div class="section smart-layer"><div class="title">🔥 BARON EARLY MOVES</div><div id="baron-early-moves" class="card" style="font-size:12px;max-height:300px;overflow:auto">Loading...</div></div>
@@ -1285,12 +1396,17 @@ def data():
             "trade_thesis": STATE.get("trade_thesis", {}),
             "current_confidence": STATE.get("current_confidence", 50.0),
             "market_regime": STATE.get("market_regime", "UNKNOWN"),
+            "market_state": safe_json(_normalize_payload(MEMORY.get("market_state", {}))),
             "continuation_pressure": STATE.get("continuation_pressure", 50),
             "thesis_failure_score": STATE.get("thesis_failure_score", 0),
             "institutional_flow": institutional_flow_data,
             "last_live_refresh": DASHBOARD_STATE.get("last_live_refresh", time.time()),
             "intent_engine": intent_data,
             "dynamic_trade": dynamic_trade_data,
+            "adaptive_trade_intelligence": {
+                "entry_assessment": safe_json(_normalize_payload(STATE.get("adaptive_entry_assessment", {}))),
+                "outcome": safe_json(_normalize_payload(STATE.get("adaptive_outcome", {}))),
+            },
             "allocation": MEMORY.get("portfolio_allocation", None),
             **live_data
         }
@@ -1454,9 +1570,18 @@ def trades_endpoint():
 
 @app.route("/intelligence")
 def intelligence_endpoint():
-    return jsonify({"status":"OK","early_moves":safe_json(_normalize_payload(MEMORY.get("early_moves", []))),
+    watch = MEMORY.get("watchlist", {}) or {}
+    if isinstance(watch, dict):
+        setups = list(watch.values())
+    else:
+        setups = list(watch or [])
+    setups = [x for x in setups if isinstance(x, dict) and x.get("institutional_fusion")]
+    setups.sort(key=lambda x: float((x.get("institutional_fusion") or {}).get("evidence_score", 0) or 0), reverse=True)
+    return jsonify({"status":"OK",
+                    "early_moves":safe_json(_normalize_payload(MEMORY.get("early_moves", []))),
                     "quality":MEMORY.get("market_data_quality","UNKNOWN"),
                     "institutional_flow":safe_json(_normalize_payload(MEMORY.get("institutional_flow", {}))),
+                    "institutional_setups":safe_json(_normalize_payload(setups[:30])),
                     "news_reaction":safe_json(_normalize_payload(DASHBOARD_STATE.get("news_reaction", {})))}), 200
 
 @app.route("/early-moves")
@@ -1477,6 +1602,22 @@ def data_fabric_endpoint():
                         "snapshot": safe_json(_normalize_payload(fabric.snapshot(symbol)))}) , 200
     except Exception as exc:
         return jsonify({"status":"DEGRADED","error":str(exc)}), 200
+
+@app.route("/ai-learning")
+def ai_learning_endpoint():
+    """Read-only adaptive trade intelligence view for the dashboard."""
+    try:
+        ati = getattr(E, "GLOBAL_ADAPTIVE_TRADE_INTELLIGENCE", None)
+        if ati is None:
+            return jsonify({"status": "DISABLED", "summary": {}, "playbook": [], "recent": []}), 200
+        return jsonify({
+            "status": "OK",
+            "summary": safe_json(_normalize_payload(ati.summary())),
+            "playbook": safe_json(_normalize_payload(ati.playbook(12))),
+            "recent": safe_json(_normalize_payload(ati.recent(20))),
+        }), 200
+    except Exception as exc:
+        return jsonify({"status": "DEGRADED", "error": str(exc), "summary": {}, "playbook": [], "recent": []}), 200
 
 @app.route("/health")
 def health():

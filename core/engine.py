@@ -80,6 +80,7 @@ from enum import Enum
 from collections import deque
 import queue as qlib
 import copy
+import sys
 
 try:
     from core.evidence_bus import EvidenceBus
@@ -101,23 +102,93 @@ try:
 except Exception:
     NativeProtectionManager = None
 try:
+    from execution.execution_service import ExecutionService, ExecutionAction
+    from core.unified_trade_management_brain import UnifiedTradeManagementBrain
+    from execution.bingx_websocket import BingXAccountStream
+    from execution.bingx_rest import BingXSignedREST
+    from execution.reconciliation import ExchangeReconciliation
+except Exception:
+    ExecutionService = None
+    ExecutionAction = None
+    UnifiedTradeManagementBrain = None
+    BingXAccountStream = None
+    ExchangeReconciliation = None
+    BingXSignedREST = None
+try:
     from core.early_discovery import analyze_formation, classify_move_maturity
 except Exception:
     analyze_formation = None
     classify_move_maturity = None
+
+try:
+    from core.institutional_entry_engine import InstitutionalEntryEngine
+    from core.market_regime_engine import MarketRegimeEngine
+    GLOBAL_INSTITUTIONAL_ENTRY_ENGINE = InstitutionalEntryEngine()
+    GLOBAL_MARKET_REGIME_ENGINE = MarketRegimeEngine()
+except Exception as _ie_import_err:
+    InstitutionalEntryEngine = None
+    MarketRegimeEngine = None
+    GLOBAL_INSTITUTIONAL_ENTRY_ENGINE = None
+    GLOBAL_MARKET_REGIME_ENGINE = None
+    print("[ENTRY_INTEL_V2] unavailable:", _ie_import_err)
+try:
+    from core.ema_vwap_trade_management import EMA200VWAPManager
+    GLOBAL_EMA200_VWAP_MANAGER = EMA200VWAPManager()
+except Exception as _ev_import_err:
+    EMA200VWAPManager = None
+    GLOBAL_EMA200_VWAP_MANAGER = None
+    print("[EMA_VWAP_MGMT] unavailable:", _ev_import_err)
+try:
+    from core.entry_forensics import propose_dynamic_sl, ratchet_stop, classify_stop_event
+except Exception:
+    propose_dynamic_sl = None
+    ratchet_stop = None
+    classify_stop_event = None
+try:
+    from core.stop_hunt_reentry import evaluate_reentry, make_thesis_fingerprint
+except Exception:
+    evaluate_reentry = None
+    make_thesis_fingerprint = None
+try:
+    from core.trend_strategy_v29 import BaronTrendStrategyV29
+    GLOBAL_TREND_STRATEGY_V29 = BaronTrendStrategyV29()
+except Exception as _trend_v29_import_err:
+    BaronTrendStrategyV29 = None
+    GLOBAL_TREND_STRATEGY_V29 = None
+    print("[TREND_V29] unavailable:", _trend_v29_import_err)
 try:
     from core.setup_edge import SetupEdgeEngine
 except Exception:
     SetupEdgeEngine = None
 try:
+    from core.adaptive_trade_intelligence import GLOBAL_ADAPTIVE_TRADE_INTELLIGENCE
+except Exception:
+    GLOBAL_ADAPTIVE_TRADE_INTELLIGENCE = None
+try:
     from core.vpa import analyze_vpa
 except Exception:
     analyze_vpa = None
+
+# Partition AI is an observability-only forensic layer. It never gates, opens,
+# closes, or modifies trades. Production execution remains owned by this engine
+# and the unified management path.
+try:
+    from core.partition_ai import GLOBAL_PARTITION_AI
+    PARTITION_AI_AVAILABLE = True
+except Exception as _partition_ai_import_exc:
+    GLOBAL_PARTITION_AI = None
+    PARTITION_AI_AVAILABLE = False
+    print("[PARTITION_AI] unavailable:", _partition_ai_import_exc)
 
 try:
     from core.decision_journal import append_event as _append_decision_journal
 except Exception:
     _append_decision_journal = None
+try:
+    from core.decision_path_telemetry import emit as _emit_decision_path, market_snapshot as _decision_market_snapshot
+except Exception:
+    _emit_decision_path = None
+    _decision_market_snapshot = None
 
 # Process-wide shutdown barrier.  All background workers must observe this
 # before interpreter finalization so daemon threads never write to stdout while
@@ -173,6 +244,8 @@ except Exception:  # pragma: no cover
 # use as an evidence layer around the preserved execution kernel.
 try:
     from core.trade_intelligence import analyze_setup, TradeManagementBoard
+    from core.institutional_evidence import analyze_institutional_evidence
+    from core.forecast_evidence import analyze_forecast_evidence
     TRADE_INTELLIGENCE_AVAILABLE = True
 except Exception as _ti_import_err:  # pragma: no cover
     analyze_setup = None
@@ -512,82 +585,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 _last_tg_msg = {}
 
-# ========== CLOSE-IDENTITY LEDGER (durable Telegram dedup) ==========
-# Root-cause (duplicate "TRADE CLOSED" telegrams with changing REC ids): a
-# physical position that disappears from local context can be re-adopted from
-# the venue with a NEW trade_id (REC-{symbol}-{side}-{millis}); each re-adoption
-# that then reaches finalize emits a fresh close notification whose send_once
-# dedup key (close_{trade_id or symbol}, 10s in-memory) is defeated by the new
-# id. The stable identity of a PHYSICAL position is its venue attributes, not
-# the local record id: symbol|side|entry|qty_initial. Once a close for that
-# identity has been announced, the SAME physical position must never re-announce
-# inside the dedup window -- even after a restart (this ledger is durable).
-_CLOSE_LEDGER_PATH = os.getenv("CLOSE_LEDGER_PATH", "runtime/close_identity_ledger.json")
-CLOSE_ANNOUNCE_DEDUP_WINDOW = float(os.getenv("CLOSE_ANNOUNCE_DEDUP_WINDOW", "86400"))
-_close_identity_ledger = {}
-_ledger_lock = threading.Lock()
-_ledger_loaded = False
-
-
-def _close_identity_key(symbol, side, entry, qty_initial):
-    """Stable identity of a physical position for close-announcement dedup.
-    Uses venue attributes only (never the local REC trade_id, which changes on
-    every re-adoption that produced the duplicate notifications)."""
-    try:
-        _e = round(float(entry or 0.0), 8)
-    except Exception:
-        _e = 0.0
-    try:
-        _q = round(float(qty_initial or 0.0), 8)
-    except Exception:
-        _q = 0.0
-    return f"{symbol}|{str(side).upper()}|{_e:.8f}|{_q:.8f}"
-
-
-def _load_close_ledger():
-    global _close_identity_ledger, _ledger_loaded
-    if _ledger_loaded:
-        return
-    try:
-        if os.path.exists(_CLOSE_LEDGER_PATH):
-            with open(_CLOSE_LEDGER_PATH, "r", encoding="utf-8") as fh:
-                _close_identity_ledger = json.load(fh) or {}
-    except Exception:
-        _close_identity_ledger = {}
-    _ledger_loaded = True
-
-
-def _reset_close_ledger():
-    global _close_identity_ledger, _ledger_loaded
-    with _ledger_lock:
-        _close_identity_ledger = {}
-        _ledger_loaded = True
-
-
-def _persist_close_ledger():
-    try:
-        _dir = os.path.dirname(_CLOSE_LEDGER_PATH)
-        if _dir:
-            os.makedirs(_dir, exist_ok=True)
-        with open(_CLOSE_LEDGER_PATH, "w", encoding="utf-8") as fh:
-            json.dump(_close_identity_ledger, fh, ensure_ascii=False)
-    except Exception:
-        pass
-
-
-def _is_close_announced(key):
-    with _ledger_lock:
-        _load_close_ledger()
-        ts = _close_identity_ledger.get(key, 0.0)
-        return (time.time() - ts) < CLOSE_ANNOUNCE_DEDUP_WINDOW
-
-
-def _announce_close(key):
-    with _ledger_lock:
-        _close_identity_ledger[key] = time.time()
-        _persist_close_ledger()
-
-
 def _tg_send(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -642,18 +639,7 @@ def tg_close(symbol, pnl_pct, duration_min, side, pnl_usdt=None, reason=None, tr
     )
     if trade_id:
         msg += f"\n🆔 {str(trade_id)[:60]}"
-    # Durable dedup: the same PHYSICAL position (same symbol/side/entry/qty) must
-    # never re-announce its close, even after a restart or after being re-adopted
-    # with a brand-new REC id. The identity ignores trade_id on purpose.
-    _id_key = _close_identity_key(
-        symbol, side, entry if entry is not None else STATE.get("entry"),
-        STATE.get("qty_initial") or STATE.get("qty") or 0.0,
-    )
-    if _is_close_announced(_id_key):
-        log_execution(f"[TELEGRAM] close already announced for {symbol} {side}; suppressing duplicate (identity {_id_key})", "WARN", debounce_key=f"tg_dup_{_id_key}", debounce_sec=60)
-        return
-    _announce_close(_id_key)
-    send_once(msg, f"close_{_id_key}", 10)
+    send_once(msg, f"close_{trade_id or symbol}", 10)
 
 def tg_error(err_msg, error_type="EXECUTION"):
     send_once(f"🚨 <b>ERROR</b> [{error_type}]\n{err_msg[:200]}", f"err_{error_type}_{err_msg[:50]}", 60)
@@ -676,7 +662,7 @@ DEFAULT_SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
 INTERVAL = os.getenv("INTERVAL", "15m")
 LEVERAGE = 10
 
-USE_PPE = True
+USE_PPE = False  # compatibility helper retained; runtime management is Brain-only
 
 # === EXECUTION QUEUE CONFIGURATION ===
 USE_EXECUTION_QUEUE = os.getenv("USE_EXECUTION_QUEUE", "True") == "True"
@@ -703,27 +689,9 @@ MAX_CONSECUTIVE_LOSSES = 3
 COOLDOWN_MINUTES_LOSS = 10
 COOLDOWN_MINUTES_DRAWDOWN = 20
 
-# ===== SINGLE-TP PROFIT TAKING (authoritative, one source of truth) =====
-# When enabled, TP1 is the ONLY take-profit: it closes the FULL remaining
-# position (100%) through the same verified close pipeline used by TP2.
-# TP2, runner-mode extension and partial scale-outs are all disabled in this
-# mode. These knobs are intentionally derived from SINGLE_TP_ENABLED so there
-# is never a second, competing profit-taking authority.
-SINGLE_TP_ENABLED = os.getenv("SINGLE_TP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-SINGLE_TP_CLOSE_FRACTION = 1.0
-TP2_ENABLED = not SINGLE_TP_ENABLED
-RUNNER_ENABLED = not SINGLE_TP_ENABLED
-PARTIAL_CLOSE_ENABLED = not SINGLE_TP_ENABLED
-
 SNAPSHOT_INTERVAL = 15
 BASE_SLEEP = 5
 KEEP_ALIVE_INTERVAL = 300
-
-# After a LIVE partial-close order is confirmed filled, the exchange position
-# endpoint may lag the order fill. Bound the convergence poll in close_partial
-# (LIVE) so local state never waits forever and never treats a transient stale
-# quantity as truth. Synchronization only -- never a trading decision authority.
-POSITION_CONFIRM_TIMEOUT = float(os.getenv("POSITION_CONFIRM_TIMEOUT", "3.0"))
 
 # External intelligence is advisory/alert-only. It must never call execute_entry().
 EXTERNAL_INTELLIGENCE_ENABLED = os.getenv("EXTERNAL_INTELLIGENCE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -745,7 +713,7 @@ INSUFFICIENT_MARGIN_COOLDOWN_SEC = 60
 #     technical model: 2 CRYPTO / 2 INDEX / 1 GOLD / 1 OIL + independent NEWS).
 POSITION_MARGIN_PCT = float(os.getenv("POSITION_MARGIN_PCT", "0.10"))
 PORTFOLIO_MARGIN_CAP_PCT = float(os.getenv("PORTFOLIO_MARGIN_CAP_PCT", "0.60"))
-MAX_OPEN_POSITIONS = max(1, int(os.getenv("MAX_OPEN_POSITIONS", "6")))
+MAX_OPEN_POSITIONS = 6  # BARON hard cap: 5 technical + 1 independent News
 
 SCAN_INTERVAL = 900
 WATCHLIST_REFRESH = 300
@@ -2065,6 +2033,8 @@ class ExchangeSyncService:
         self._reconcile_count = 0
         self._last_reconcile = 0
         self._last_reconcile_by_symbol = {}
+        self._last_order_reconcile = 0.0
+        self._ws_last_event = None
 
     def fetch_all_open_positions(self):
         """All open positions across symbols (recovery source for PortfolioManager)."""
@@ -2091,12 +2061,17 @@ class ExchangeSyncService:
             if contracts <= 0:
                 continue
             side = str(p.get("side") or "").lower()
+            info = p.get("info") if isinstance(p.get("info"), dict) else {}
             out.append({
                 "symbol": p.get("symbol"),
                 "side": "BUY" if side == "long" else "SELL",
                 "entryPrice": float(p.get("entryPrice") or 0.0),
                 "contracts": contracts,
                 "markPrice": float(p.get("markPrice") or 0.0),
+                "positionId": p.get("positionId") or p.get("id") or info.get("positionId"),
+                "positionSide": p.get("positionSide") or info.get("positionSide"),
+                "isolated": p.get("isolated"),
+                "marginMode": p.get("marginMode") or info.get("marginMode") or info.get("marginType"),
             })
         return out
 
@@ -2203,6 +2178,21 @@ class ExchangeSyncService:
                     "trade_id": local_state.get("trade_id"),
                 })
             return
+        order_state, fill_state = "UNKNOWN", "UNKNOWN"
+        if not PAPER_MODE and (now - self._last_order_reconcile) >= float(os.getenv("EXCHANGE_ORDER_RECONCILE_SEC", "30")):
+            self._last_order_reconcile = now
+            try:
+                open_orders = safe_api_call(ex.fetch_open_orders, normalize_symbol(symbol)) or []
+                order_state = "NO_OPEN_ORDERS" if not open_orders else "OPEN_ORDERS"
+                STATE["exchange_open_orders"] = open_orders[:20]
+            except Exception as _oe:
+                order_state = "DATA_UNAVAILABLE"
+            try:
+                fills = safe_api_call(ex.fetch_my_trades, normalize_symbol(symbol), limit=20) or []
+                fill_state = "AVAILABLE" if fills else "NO_RECENT_FILLS"
+                STATE["exchange_recent_fills"] = fills[-20:]
+            except Exception:
+                fill_state = "DATA_UNAVAILABLE"
         with _TRADE_LOCK:
             STATE["entry"] = snap.entry_price
             STATE["qty"] = snap.qty
@@ -2226,7 +2216,27 @@ class ExchangeSyncService:
                 STATE["open"] = True
                 STATE["current_symbol"] = symbol
                 STATE["entry_time"] = time.time()
-        log_execution(f"[RECONCILIATION] Completed: ROE={snap.roe_pct:.2f}%, Qty={snap.qty}", "SUCCESS")
+        rec_state = "SYNCED"
+        try:
+            _orders_checked = not (order_state == "UNKNOWN")
+            _fills_checked = not (fill_state == "UNKNOWN")
+            _provider_ok = order_state not in {"DATA_UNAVAILABLE"} and fill_state not in {"DATA_UNAVAILABLE"}
+            _data_ok = not (not PAPER_MODE and (order_state == "DATA_UNAVAILABLE" or fill_state == "DATA_UNAVAILABLE"))
+            if ExchangeReconciliation is not None:
+                rr = ExchangeReconciliation.compare(symbol, STATE.get("remaining_qty", snap.qty), snap.qty,
+                                                    order_state=order_state, fill_state=fill_state,
+                                                    data_available=_data_ok, provider_ok=_provider_ok)
+                rec_state = rr.state
+                DASHBOARD_STATE["reconciliation"] = rr.to_dict()
+        except Exception as _rr_exc:
+            rec_state = "UNKNOWN"
+            DASHBOARD_STATE["reconciliation"] = {"state": "UNKNOWN", "difference": str(_rr_exc)}
+        STATE["reconciliation_state"] = rec_state
+        STATE["order_reconciliation_state"] = order_state
+        STATE["fill_reconciliation_state"] = fill_state
+        _trade_event("RECONCILIATION_OK" if rec_state == "SYNCED" else "RECONCILIATION_DRIFT",
+                     order_state=order_state, fill_state=fill_state, reconciliation_state=rec_state)
+        log_execution(f"[RECONCILIATION] Completed: ROE={snap.roe_pct:.2f}%, Qty={snap.qty}, State={rec_state}", "SUCCESS" if rec_state == "SYNCED" else "WARN")
         self.event_bus.emit("reconciled", snap)
 
 class RecoveryGuard:
@@ -2889,14 +2899,6 @@ class AssetBehaviorProfile:
                    "roe_trail_activate": 0.8, "runner_bias": 0.5},
     }
 
-    # Full set of classes the authoritative classifier may return. Kept separate
-    # from DEFAULT (which only holds tuned profiles) so ETF/METAL/ENERGY/FOREX
-    # and fail-closed UNKNOWN resolve through resolve_asset_class instead of
-    # dropping into the legacy heuristics.
-    _RESOLVED_CLASSES = frozenset(
-        {"CRYPTO", "INDEX", "STOCK", "ETF", "GOLD", "OIL", "METAL", "ENERGY",
-         "FOREX", "UNKNOWN"})
-
     # Per asset-class Order-Block / zone detection tuning (OB_ASSET_TUNING).
     # OB_UNIFIED mirrors the legacy hardcoded behaviour exactly; when tuning is
     # disabled the merged config for EVERY class equals OB_UNIFIED so no existing
@@ -3001,13 +3003,12 @@ class AssetBehaviorProfile:
     @classmethod
     def resolve_asset_class(cls, symbol: str) -> str:
         """Best-effort asset classification from a symbol when portfolio context
-        is not available. Returns one of CRYPTO/INDEX/STOCK/ETF/GOLD/OIL/METAL/
-        ENERGY/FOREX — or UNKNOWN, never CRYPTO, when no exchange-grounded
-        evidence exists (a malformed or metadata-free shape must fail closed)."""
+        is not available. Returns one of CRYPTO/INDEX/GOLD/OIL/STOCK — or FOREX
+        for NCFX instruments (discovered, never opened: cap-0 fail-closed)."""
         try:
             from portfolio.manager import PortfolioManager
             ac = PortfolioManager._asset_class(symbol)
-            if ac and ac.upper() in cls._RESOLVED_CLASSES:
+            if ac and (ac.upper() in cls.DEFAULT or ac.upper() == "FOREX"):
                 return ac.upper()
         except Exception:
             pass
@@ -3020,12 +3021,7 @@ class AssetBehaviorProfile:
             return "INDEX"
         if any(t in up for t in ("AAPL", "MSFT", "TSLA", "AMZN", "GOOG", "NVDA", "META", "NFLX")):
             return "STOCK"
-        if any(t in up for t in ("EWJ", "EWY", "QQQ", "SPY", "TQQQ", "DIA")):
-            return "ETF"
-        # FAIL-CLOSED tail: CRYPTO requires the venue margin-pair shape.
-        if "USDT" in up or "USDC" in up:
-            return "CRYPTO"
-        return "UNKNOWN"
+        return "CRYPTO"
 
 
 # -----------------------------------------------------------------------------
@@ -3745,9 +3741,9 @@ def verify_order_filled(symbol, order_id, side, expected_qty, timeout=10):
             if order:
                 status = order.get('status')
                 filled = order.get('filled', 0)
-                if status == 'closed' and filled >= expected_qty * 0.999:
+                if str(status).lower() in {'closed','filled'} and float(filled or 0) >= expected_qty * 0.999:
                     return True, filled
-                elif status == 'open' or status == 'partial':
+                elif str(status).lower() in {'open','partial','partially_filled'}:
                     time.sleep(0.5)
                     continue
             pos = fetch_position(symbol)
@@ -3764,12 +3760,13 @@ _reconciliation_pending = False
 
 
 def _hedge_position_side(direction):
-    """Derive the hedging PositionSide from the POSITION direction.
+    """Derive the BingX hedge-mode PositionSide from the POSITION direction.
 
-    Historically the account assumes Hedge Mode, where PositionSide must be LONG
-    or SHORT (never BOTH). This maps the bot's internal position direction
-    (BUY=long, SELL=short) to the hedging value. PositionSide always reflects
-    the position being opened or closed, not the order side.
+    The account runs in Hedge Mode, which requires PositionSide to be LONG or
+    SHORT (never BOTH). This maps the bot's internal position direction
+    (BUY=long, SELL=short; also accepts buy/sell/LONG/SHORT/long/short) to the
+    exchange's hedge-mode value. PositionSide always reflects the position being
+    opened or closed, not the order side.
     """
     d = str(direction).upper()
     if d in ("BUY", "LONG"):
@@ -3779,154 +3776,84 @@ def _hedge_position_side(direction):
     raise ValueError(f"cannot derive hedge positionSide from direction: {direction!r}")
 
 
-# ========== BINGX POSITION-MODE AWARE CLOSE (exchange-authoritative) ==========
-# BingX Futures runs in either One-way Mode (single position per pair, PositionSide
-# must be BOTH and reduceOnly=true prevents flipping into the opposite position) or
-# Hedge Mode (dual positions per pair, PositionSide LONG/SHORT, and reduceOnly must
-# NOT be sent). A close that ignores the account's actual mode can be rejected
-# (109400) or, worse, open the OPPOSITE position. The mode is therefore queried
-# from the venue before a close order is assembled, never guessed from config.
-_POSITION_MODE_CACHE = {"mode": None, "ts": 0.0}
-POSITION_MODE_CACHE_TTL = float(os.getenv("POSITION_MODE_CACHE_TTL", "120"))
+_BINGX_POSITION_MODE_CACHE = {"mode": None, "ts": 0.0}
 
-# Bounded venue re-confirmation window after a close order is filled. Tuning
-# these lower (tests) gives fast-fail behaviour for the post-close confirm.
-CLOSE_CONFIRM_TIMEOUT = float(os.getenv("CLOSE_CONFIRM_TIMEOUT", "10"))
-CLOSE_CONFIRM_INTERVAL = float(os.getenv("CLOSE_CONFIRM_INTERVAL", "1"))
+def get_bingx_position_mode(force=False):
+    """Return the current BingX swap account position mode without guessing.
 
-
-def _detect_position_mode():
-    """Return the venue position mode: "hedge" | "oneway" | "unknown".
-
-    Primary source: ccxt bingx fetch_position_mode() -> GET /openApi/swap/v1/
-    positionSide/dual (dualSidePosition). Production ccxt.bingx exposes this
-    method, so LIVE close always uses venue truth. When the venue method is not
-    available (offline unit seams), fall back to the configured POSITION_MODE
-    (default "hedge" -- the account's documented mode) so deterministic test
-    venues never get their scripted position data consumed by mode inference.
-    A failed query returns "unknown" so the close path fails closed.
+    Live mode uses the official position-side endpoint and caches briefly.
+    Tests/paper may provide BINGX_POSITION_MODE=HEDGE|ONE_WAY. If live mode
+    cannot establish the mode, return None so order-routing can fail closed.
     """
-    global _POSITION_MODE_CACHE
+    configured = str(os.getenv("BINGX_POSITION_MODE", "")).strip().upper().replace("-", "_")
+    if not MODE_LIVE and configured in {"HEDGE", "ONE_WAY", "ONEWAY"}:
+        return "ONE_WAY" if configured in {"ONE_WAY", "ONEWAY"} else "HEDGE"
     now = time.time()
-    cached = _POSITION_MODE_CACHE.get("mode")
-    if cached and (now - _POSITION_MODE_CACHE.get("ts", 0.0)) < POSITION_MODE_CACHE_TTL:
-        return cached
-    mode = "unknown"
+    if not force and _BINGX_POSITION_MODE_CACHE.get("mode") and now - _BINGX_POSITION_MODE_CACHE.get("ts", 0.0) < 30:
+        return _BINGX_POSITION_MODE_CACHE["mode"]
+    if not MODE_LIVE:
+        return "HEDGE"
     try:
-        fpm = getattr(ex, "fetch_position_mode", None)
-        if callable(fpm):
-            info = fpm()
-            if isinstance(info, dict):
-                hedged = info.get("hedged")
-                if hedged is not None:
-                    mode = "hedge" if hedged else "oneway"
-    except Exception as _me:
-        log_execution(f"[POSITION_MODE] fetch_position_mode failed: {_me}", "WARN")
-    if mode == "unknown":
-        env_mode = str(os.getenv("POSITION_MODE", "hedge")).strip().lower()
-        if env_mode in ("hedge", "oneway"):
-            mode = env_mode
-    _POSITION_MODE_CACHE = {"mode": mode, "ts": now}
-    if mode == "hedge":
-        log_execution("[POSITION_MODE] close context: HEDGE mode (positionSide LONG/SHORT, no reduceOnly)", "INFO")
-    elif mode == "oneway":
-        log_execution("[POSITION_MODE] close context: ONE-WAY mode (positionSide BOTH + reduceOnly=true)", "WARN")
+        if BingXSignedREST is None:
+            return None
+        rest = globals().get("_BINGX_REST_HELPER")
+        if rest is None:
+            rest = BingXSignedREST()
+            globals()["_BINGX_REST_HELPER"] = rest
+        data = rest.request("GET", "/openApi/swap/v1/positionSide/dual") or {}
+        dual = data.get("dualSidePosition") if isinstance(data, dict) else None
+        mode = "HEDGE" if bool(dual) else "ONE_WAY" if dual is not None else None
+        if mode:
+            _BINGX_POSITION_MODE_CACHE.update(mode=mode, ts=now)
+        return mode
+    except Exception as exc:
+        log_execution(f"[BINGX_MODE] unable to query position mode: {exc}", "WARN")
+        return None
+
+def _order_position_params(direction=None, *, closing=False, position_id=None):
+    """Build BingX order params from current exchange position mode.
+
+    Hedge: LONG/SHORT, never reduceOnly. One-way: BOTH and reduceOnly only
+    when the order is explicitly reducing/closing. No guessed mode in LIVE.
+    """
+    mode = get_bingx_position_mode()
+    if mode == "HEDGE":
+        params = {"positionSide": _hedge_position_side(direction)}
+    elif mode == "ONE_WAY":
+        params = {"positionSide": "BOTH"}
+        if closing:
+            params["reduceOnly"] = True
     else:
-        log_execution("[POSITION_MODE] cannot determine position mode; failing closed on mode-ambiguous close", "ERROR")
-    return mode
-
-
-def _reset_position_mode_cache():
-    global _POSITION_MODE_CACHE
-    _POSITION_MODE_CACHE = {"mode": None, "ts": 0.0}
-
-
-def _close_order_params(pos_side, mode="unknown"):
-    """BingX-mode-correct params for a CLOSE order.
-
-    hedge        -> {"positionSide": pos_side}            (reduceOnly NOT allowed)
-    oneway       -> {"positionSide": "BOTH", "reduceOnly": True} (default reduceOnly
-                    in one-way mode is FALSE, so an explicit True is mandatory to
-                    guarantee the order can never flip into the opposite position)
-    unknown      -> None (caller must fail closed; never guess a mode)
-    """
-    if mode == "hedge":
-        return {"positionSide": pos_side}
-    if mode == "oneway":
-        return {"positionSide": "BOTH", "reduceOnly": True}
-    return None
-
-
-def _close_side_for(pos_side):
-    """Closing order side: a LONG position is reduced by SELL, a SHORT by BUY.
-    This invariant is what prevents a close from ACCIDENTALLY OPENING the
-    opposite position."""
-    return "sell" if str(pos_side).upper() == "LONG" else "buy" if str(pos_side).upper() == "SHORT" else "sell"
-
-
-def _close_min_qty_failure_reason(symbol, sym, qty, price):
-    """Deterministic close-qty failure codes (exchange-authoritative guard).
-
-    Returns a (reason, emitted) tuple. reason is one of:
-      CLOSE_QTY_INVALID           qty is not positive
-      CLOSE_QTY_BELOW_MIN         qty < market minimum amount
-      CLOSE_NOTIONAL_BELOW_MIN    qty*price < market minimum notional (cost)
-      None                        qty is closable
-    The legacy tokens (INVALID_QUANTITY_ZERO/BELOW_MIN_QUANTITY) are embedded so
-    existing callers and tests that matched them keep working while the new
-    deterministic codes are the leading token.
-    """
-    try:
-        q = float(qty or 0.0)
-    except (TypeError, ValueError):
-        q = 0.0
-    if q <= 0:
-        reason = "CLOSE_QTY_INVALID (INVALID_QUANTITY_ZERO)"
-        _trade_event("CLOSE_FAILED", reason=reason)
-        log_execution(f"[CLOSE] {symbol} close qty must be > 0 to place a close order ({q!r})", "ERROR")
-        return reason
-    market = None
-    try:
-        market = ex.market(sym)
-    except Exception:
-        market = None
-    limits = (market or {}).get("limits", {}) or {}
-    min_amt = float((limits.get("amount") or {}).get("min", 0.0) or 0.0)
-    if min_amt > 0 and q < min_amt:
-        reason = f"CLOSE_QTY_BELOW_MIN:{q:.8f}<{min_amt:.8f} (BELOW_MIN_QUANTITY)"
-        _trade_event("CLOSE_FAILED", reason=reason)
-        log_execution(f"[CLOSE] {symbol} close qty {q:.8f} below market minimum {min_amt:.8f}; refusing unsizeable close", "ERROR")
-        return reason
-    min_cost = float((limits.get("cost") or {}).get("min", 0.0) or 0.0)
-    if min_cost > 0:
-        try:
-            px = float(price or STATE.get("mark_price") or 0.0)
-        except (TypeError, ValueError):
-            px = 0.0
-        notional = q * px
-        if notional > 0 and notional < min_cost:
-            reason = f"CLOSE_NOTIONAL_BELOW_MIN:{notional:.8f}<{min_cost:.8f}"
-            _trade_event("CLOSE_FAILED", reason=reason)
-            log_execution(f"[CLOSE] {symbol} close notional {notional:.8f} below market minimum {min_cost:.8f}; refusing unsizeable close", "ERROR")
-            return reason
-    prec = (market or {}).get("precision", {}) or {}
-    _prec = prec.get("amount", 0) or 0
-    if _prec:
-        step = 10 ** -float(_prec)
-        if step > 0 and abs((q / step) - round(q / step)) > 1e-9:
-            log_execution(f"[CLOSE] {symbol} close qty {q:.8f} is not a multiple of precision step {step}", "WARN")
-    return None
-
+        raise RuntimeError("BINGX_POSITION_MODE_UNKNOWN")
+    return params
 
 def _trade_event(event, **data):
     """Emit durable lifecycle telemetry without becoming an execution authority."""
     tid = STATE.get("trade_id") or "UNKNOWN"
     symbol = STATE.get("current_symbol") or data.get("symbol") or "UNKNOWN"
     STATE["last_management_event"] = str(event).upper()
+    # Structured provenance is attached to every critical event automatically.
+    data.setdefault("trade_id", tid)
+    data.setdefault("symbol", symbol)
+    data.setdefault("asset_class", STATE.get("position_asset_class") or STATE.get("asset_class") or "UNKNOWN")
+    data.setdefault("side", STATE.get("side"))
+    data.setdefault("position_id", STATE.get("position_id"))
+    data.setdefault("order_id", STATE.get("last_order_id"))
+    data.setdefault("client_order_id", STATE.get("last_client_order_id"))
+    data.setdefault("timestamp", time.time())
+    data.setdefault("requested_qty", STATE.get("last_requested_qty"))
+    data.setdefault("executed_qty", STATE.get("last_executed_qty"))
+    data.setdefault("state", STATE.get("position_sync_status") or STATE.get("execution_state"))
+    data.setdefault("source", "BARON")
     rec = None
     try:
         if _TRADE_JOURNAL is not None:
-            rec = _TRADE_JOURNAL.emit(tid, symbol, event, **data)
+            # The journal receives trade_id/symbol as positional identity fields;
+            # do not duplicate them in **data or Python raises "multiple values".
+            journal_data = dict(data)
+            journal_data.pop("trade_id", None)
+            journal_data.pop("symbol", None)
+            rec = _TRADE_JOURNAL.emit(tid, symbol, event, **journal_data)
             DASHBOARD_STATE.setdefault("trade_lifecycle", []).append(rec)
             DASHBOARD_STATE["trade_lifecycle"] = DASHBOARD_STATE["trade_lifecycle"][-100:]
     except Exception as exc:
@@ -3936,7 +3863,8 @@ def _trade_event(event, **data):
 def _set_protection_status(status, order_id=None, reason=None):
     STATE["protection_status"] = str(status).upper()
     STATE["native_sl_order_id"] = order_id
-    payload = {"status": STATE["protection_status"], "order_id": order_id}
+    payload = {"status": STATE["protection_status"], "order_id": order_id,
+               "lifecycle": "PROTECTION_VERIFIED" if str(status).upper() == "PROTECTED" else "PROTECTION_LOST" if str(status).upper() in {"UNPROTECTED", "ERROR"} else str(status).upper()}
     if reason: payload["reason"] = str(reason)
     DASHBOARD_STATE["protection"] = payload
     try:
@@ -3945,6 +3873,54 @@ def _set_protection_status(status, order_id=None, reason=None):
     except Exception:
         pass
     return payload
+
+def _adopt_authoritative_entry_fill(state, fill):
+    """Adopt the venue-confirmed fill as the canonical entry quantity/price.
+
+    This is intentionally tiny: requested quantity is an admission value;
+    filled/average from the venue is the accounting truth used by TP1/TP2,
+    protection quantity, registry state, and dashboards.
+    """
+    if not isinstance(state, dict) or not isinstance(fill, dict):
+        return False
+    try:
+        filled = float(fill.get("filled", fill.get("amount", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        filled = 0.0
+    if filled <= 0:
+        return False
+    try:
+        avg = float(fill.get("average", fill.get("entryPrice", fill.get("price", 0.0))) or 0.0)
+    except (TypeError, ValueError):
+        avg = 0.0
+    state["qty"] = filled
+    state["qty_initial"] = filled
+    state["remaining_qty"] = filled
+    if avg > 0:
+        state["entry"] = avg
+        state["fill_request_price"] = state.get("fill_request_price") or avg
+    return True
+
+
+def _post_entry_exchange_confirmation_ok(state, sync_result):
+    """Return True only when the just-opened live position has venue truth.
+
+    A transport/API ambiguity after an accepted order is not an active position
+    confirmation. Callers must fail closed rather than register a ghost trade.
+    """
+    if not isinstance(state, dict) or not state.get("open"):
+        return False
+    if not isinstance(sync_result, tuple) or len(sync_result) < 4:
+        return False
+    if sync_result[0] is None:
+        return False
+    try:
+        qty = float(state.get("qty", 0.0) or 0.0)
+        remaining = float(state.get("remaining_qty", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return qty > 0 and remaining > 0
+
 
 def _ensure_native_protection(symbol):
     global _NATIVE_PROTECTION, _NATIVE_PROTECTION_ERROR
@@ -3968,7 +3944,7 @@ def _ensure_native_protection(symbol):
         result = _NATIVE_PROTECTION.update(
             symbol, STATE.get("side"), STATE.get("remaining_qty", STATE.get("qty", 0.0)),
             STATE.get("synthetic_sl", STATE.get("sl", 0.0)),
-            _hedge_position_side(STATE.get("side")),
+            _hedge_position_side(STATE.get("side")), position_mode=get_bingx_position_mode(),
         )
     except Exception as exc:
         _set_protection_status("UNPROTECTED",
@@ -3978,12 +3954,21 @@ def _ensure_native_protection(symbol):
     if str(result.get("status", "")).upper() == "PROTECTED":
         # Exchange confirmed protection: adopt the tracked level/quantity and
         # verify the venue position qty against the protective order qty (F1).
+        # UNKNOWN/MISMATCH is unsafe for LIVE; do not mark the protection
+        # lifecycle verified when quantity cannot be reconciled.
+        try:
+            quality, qinfo = _verify_protection_qty(
+                symbol, STATE.get("side"), STATE.get("remaining_qty", STATE.get("qty", 0.0))
+            )
+        except Exception as qexc:
+            quality, qinfo = "UNKNOWN", {"error": str(qexc)}
+        if quality != "MATCH":
+            _set_protection_status("UNPROTECTED", reason=f"PROTECTION_QTY_{quality}")
+            _trade_event("PROTECTION_QTY_UNVERIFIED", quality=quality, info=qinfo)
+            return {"status": "UNPROTECTED", "sl": float(STATE.get("last_confirmed_sl", STATE.get("sl", 0.0)) or 0.0),
+                    "reason": f"PROTECTION_QTY_{quality}"}
         STATE["last_confirmed_sl"] = float(STATE.get("synthetic_sl", STATE.get("sl", 0.0)) or 0.0)
         STATE["protection_confirmed"] = True
-        try:
-            _verify_protection_qty(symbol, STATE.get("side"), STATE.get("remaining_qty", STATE.get("qty", 0.0)))
-        except Exception:
-            pass
     return payload
 
 def _is_more_protective(side, proposed, confirmed):
@@ -4008,8 +3993,16 @@ def _verify_protection_qty(symbol, side, expected_qty):
         expected_qty = float(expected_qty or 0.0)
         rec = None
         if _NATIVE_PROTECTION is not None:
-            rec = _NATIVE_PROTECTION.info(symbol)
-        pos, pos_status = fetch_position_status(symbol)
+            try:
+                rec = _NATIVE_PROTECTION.info(symbol, _hedge_position_side(side))
+            except TypeError:
+                rec = _NATIVE_PROTECTION.info(symbol)
+        try:
+            _mode = get_bingx_position_mode()
+        except Exception:
+            _mode = None
+        _verify_leg = _hedge_position_side(side) if _mode == "HEDGE" else None
+        pos, pos_status = fetch_position_status(symbol, position_side=_verify_leg)
         if pos_status in ("PAUSED", "ERROR"):
             _trade_event("PROTECTION_QTY_UNKNOWN", reason=str(pos_status))
             return "UNKNOWN", {"pos_status": str(pos_status)}
@@ -4093,7 +4086,7 @@ def _protection_commit(symbol, side, qty, proposed_sl, reason, *,
             return {"status": "UNPROTECTED", "sl": retain_sl, "reason": f"NO_QTY:{reason}"}
         try:
             _np = _NATIVE_PROTECTION.update(symbol, side, qty, propsl,
-                                            _hedge_position_side(side))
+                                            _hedge_position_side(side), position_mode=get_bingx_position_mode())
         except Exception as exc:
             _set_protection_status("UNPROTECTED",
                                    reason=f"PROTECTION_COMMIT_FAILED: {_sanitize_reason(exc)}")
@@ -4109,9 +4102,14 @@ def _protection_commit(symbol, side, qty, proposed_sl, reason, *,
             return {"status": status, "sl": retain_sl, "reason": result.get("reason") or reason}
         if verify_qty:
             try:
-                _verify_protection_qty(symbol, side, qty)
-            except Exception:
-                pass
+                quality, qinfo = _verify_protection_qty(symbol, side, qty)
+            except Exception as qexc:
+                quality, qinfo = "UNKNOWN", {"error": str(qexc)}
+            if quality != "MATCH":
+                _set_protection_status("UNPROTECTED", reason=f"PROTECTION_QTY_{quality}")
+                _trade_event("PROTECTION_QTY_UNVERIFIED", quality=quality, info=qinfo)
+                return {"status": "UNPROTECTED", "sl": retain_sl,
+                        "reason": f"PROTECTION_QTY_{quality}"}
     elif not adopt_paper:
         # LIVE protection requirement without a configured native adapter is
         # fail-closed (see the native LIVE safety gate). No internal claim.
@@ -4189,11 +4187,15 @@ def _native_protection_gate_ok(symbol, side, score, adx_val):
     _native_protection_diagnostics(blocked=False)
     return True
 
-def _cancel_native_protection(symbol):
+def _cancel_native_protection(symbol, position_side=None):
     if _NATIVE_PROTECTION is None:
         return True
     try:
-        ok = _NATIVE_PROTECTION.cancel(symbol)
+        side = position_side or _hedge_position_side(STATE.get("side"))
+        try:
+            ok = _NATIVE_PROTECTION.cancel(symbol, side)
+        except TypeError:
+            ok = _NATIVE_PROTECTION.cancel(symbol)
         if ok:
             _set_protection_status("CANCELLED")
         return ok
@@ -4203,10 +4205,6 @@ def _cancel_native_protection(symbol):
 
 def close_partial(ratio, stage="PARTIAL"):
     global _closing_in_progress, _reconciliation_pending
-    _partial_ok = bool(PARTIAL_CLOSE_ENABLED) and not bool(SINGLE_TP_ENABLED)
-    if not _partial_ok:
-        log_execution(f"[CLOSE_PARTIAL] Partial close disabled (SINGLE_TP={bool(SINGLE_TP_ENABLED)}, PARTIAL_CLOSE_ENABLED={bool(PARTIAL_CLOSE_ENABLED)}, stage={stage})", "WARN")
-        return False
     if _closing_in_progress:
         log_execution("[CLOSE_PARTIAL] Already closing, skipping", "WARN")
         return False
@@ -4256,6 +4254,8 @@ def close_partial(ratio, stage="PARTIAL"):
                 paper["committed_margin"] = max(0.0, paper.get("committed_margin", 0.0) - released)
                 log_execution(f"[CLOSE_PARTIAL] Paper partial close {ratio*100:.0f}% | leg PnL {pnl_pct_leg:+.2f}%/{pnl_usdt_leg:+.2f} USDT | margin released {released:.2f}", "SUCCESS")
                 _trade_event("PARTIAL_CLOSE_EXECUTED", stage=str(stage).upper(), qty=closed_qty, price=mark, realized_pnl_usdt=pnl_usdt_leg, realized_pnl_pct=pnl_pct_leg, mode="PAPER", verified=True)
+                _partition_record_partial(str(stage).upper(), closed_qty, mark, pnl_usdt_leg, pnl_pct_leg)
+                _partition_observe_active_trade(price=mark, force=True)
                 return True
             return False
 
@@ -4278,10 +4278,7 @@ def close_partial(ratio, stage="PARTIAL"):
         side = "sell" if STATE["side"] == "BUY" else "buy"
         sym = normalize_symbol(symbol)
         qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
-        if not _close_partial_min_ok(symbol, sym, qty_to_close):
-            _trade_event(f"{stage_u}_EXECUTION_FAILED", reason="BELOW_MIN_QUANTITY")
-            return False
-        order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"positionSide": _hedge_position_side(STATE["side"])})
+        order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params=_order_position_params(STATE["side"], closing=True))
         if order is None:
             log_execution("[CLOSE_PARTIAL] Order creation failed (None)", "ERROR")
             _trade_event(f"{stage_u}_EXECUTION_FAILED", reason="ORDER_CREATION_FAILED")
@@ -4316,24 +4313,8 @@ def close_partial(ratio, stage="PARTIAL"):
                 STATE["tp1_closed_qty"] = min(target_tp1_qty, float(STATE.get("tp1_closed_qty", 0.0) or 0.0) + float(filled_qty))
             TRADE_STATE["qty"] = STATE["remaining_qty"]
             log_execution(f"[CLOSE_PARTIAL] LIVE leg realized: {pnl_pct_leg:+.2f}% / {pnl_usdt_leg:+.2f} USDT @ {fill_price:.6f}", "SUCCESS")
-            expected_remaining = max(0.0, STATE.get("remaining_qty", 0.0) or 0.0)
+            time.sleep(1)
             pos, pos_status = fetch_position_status(symbol)
-            # Position endpoint may lag the just-confirmed fill; poll (bounded)
-            # until the residual quantity converges instead of a fixed wait.
-            # A transient NOT_FOUND while a residual is expected is the same
-            # convergence condition and is re-polled within the SAME window;
-            # a NOT_FOUND that persists through the window keeps the existing
-            # immediate terminal branch below. PAUSED/ERROR stay fail-closed.
-            # Synchronization only -- never a trading decision authority.
-            _pos_confirm_start = time.time()
-            while (expected_remaining > 1e-9
-                   and time.time() - _pos_confirm_start < POSITION_CONFIRM_TIMEOUT
-                   and (pos_status == "NOT_FOUND"
-                        or (pos_status == "OK" and pos is not None
-                            and abs(float(pos.get("contracts", 0)) - expected_remaining)
-                                >= 0.0001 * max(1, expected_remaining)))):
-                time.sleep(0.5)
-                pos, pos_status = fetch_position_status(symbol)
             if pos_status in ("ERROR", "PAUSED"):
                 _trade_event("POSITION_STATUS_UNKNOWN", reason=pos_status)
                 log_execution(f"[CLOSE_PARTIAL] Position status UNKNOWN ({pos_status}); preserving local state", "ERROR")
@@ -4365,6 +4346,8 @@ def close_partial(ratio, stage="PARTIAL"):
                     finalize_trade_with_reality(symbol)
             _exchange_sync.reconcile(symbol, STATE)
             _trade_event("TP1_EXECUTED", stage=str(stage).upper(), qty=filled_qty, price=fill_price, realized_pnl_usdt=pnl_usdt_leg, realized_pnl_pct=pnl_pct_leg, mode="LIVE", verified=True)
+            _partition_record_partial(str(stage).upper(), filled_qty, fill_price, pnl_usdt_leg, pnl_pct_leg)
+            _partition_observe_active_trade(price=fill_price, force=True)
             return True
         else:
             log_execution(f"[CLOSE_PARTIAL] Partial close failed to fill after timeout", "ERROR")
@@ -4502,84 +4485,6 @@ def _sync_closed_on_exchange(symbol, reason, pos_side, opposite_exists=False, fr
     return True
 
 
-def _close_partial_min_ok(symbol, sym, qty):
-    """LIVE close safety: validate a close quantity against the venue's market
-    limits (zero / min amount / min notional) BEFORE an order is placed. A tiny
-    or overflowing remainder must never be blindly re-ordered -- the exchange
-    would reject it and the close lifecycle would retry forever. Returns False
-    and emits CLOSE_FAILED when the quantity cannot possibly fill.
-    Delegates to the deterministic code helper (CLOSE_QTY_INVALID /
-    CLOSE_QTY_BELOW_MIN / CLOSE_NOTIONAL_BELOW_MIN)."""
-    try:
-        checked = _close_min_qty_failure_reason(symbol, sym, qty, STATE.get("mark_price"))
-        return checked is None
-    except Exception:
-        # Limit lookup is advisory-only: never block a close on a metadata
-        # fetch failure. The verified position path is authoritative.
-        return True
-
-
-def _close_failure_code_for(symbol, sym, qty):
-    """Derive the deterministic close failure code for a rejected quantity
-    without re-triggering side effects (events/logs) of the min-ok checker."""
-    try:
-        q = float(qty or 0.0)
-    except (TypeError, ValueError):
-        q = 0.0
-    if q <= 0:
-        return "CLOSE_QTY_INVALID"
-    try:
-        market = ex.market(sym)
-        min_amt = float((market.get("limits", {}).get("amount") or {}).get("min", 0.0) or 0.0)
-        if min_amt > 0 and q < min_amt:
-            return "CLOSE_QTY_BELOW_MIN"
-        min_cost = float((market.get("limits", {}).get("cost") or {}).get("min", 0.0) or 0.0)
-        if min_cost > 0:
-            try:
-                px = float(STATE.get("mark_price") or 0.0)
-            except (TypeError, ValueError):
-                px = 0.0
-            if q * px > 0 and q * px < min_cost:
-                return "CLOSE_NOTIONAL_BELOW_MIN"
-    except Exception:
-        pass
-    return "CLOSE_QTY_INVALID"
-
-
-def _confirm_exchange_zero(symbol, pos_side, timeout=None, interval=None):
-    """Bounded post-close confirmation: keep re-querying the venue until the
-    requested hedge leg reports zero/absent, the window expires, or the venue
-    errors. NOT_FOUND is authoritative (CLOSED). A PAUSED/ERROR within the
-    window must NOT be treated as closed -- fail closed (UNKNOWN). Returns
-    'CLOSED' | 'PRESENT' | 'UNKNOWN'."""
-    total = float(timeout if timeout is not None else CLOSE_CONFIRM_TIMEOUT)
-    wait = float(interval if interval is not None else CLOSE_CONFIRM_INTERVAL)
-    deadline = time.time() + total
-    last_status = None
-    last_qty = 0.0
-    while True:
-        snap = _verify_close_target(symbol, pos_side)
-        st = snap["status"]
-        if st in ("PAUSED", "ERROR"):
-            last_status = st
-        elif st == "OK":
-            if not snap["exists"] or snap["actual_qty"] <= 0:
-                return "CLOSED"
-            last_qty = snap["actual_qty"]
-            last_status = "OK"
-        else:
-            # NOT_FOUND status from fetch_position_status is used only when pos
-            # is None; exists is authoritative regardless of the status label.
-            if not snap["exists"] or snap["actual_qty"] <= 0:
-                return "CLOSED"
-        if time.time() >= deadline:
-            break
-        time.sleep(wait)
-    if last_status in ("PAUSED", "ERROR") or last_status is None:
-        return "UNKNOWN"
-    return "PRESENT" if last_qty > 0 else "CLOSED"
-
-
 def _close_full_live_verified(symbol, sym, pos_side, stage, requested_qty):
     """Verified full-close transaction (LIVE mode only).
 
@@ -4587,20 +4492,8 @@ def _close_full_live_verified(symbol, sym, pos_side, stage, requested_qty):
     Position Verify -> State Sync. Every close order is preceded by a fresh
     leg verify; a leg that vanished is synced as ALREADY_CLOSED_ON_EXCHANGE and
     never re-ordered. BingX 101205 is re-verified, never blindly swallowed.
-    The order params are chosen from the venue's ACTUAL position mode
-    (hedge vs one-way) so a one-way account closes with positionSide=BOTH +
-    reduceOnly=true, never fashioning a NEW opposite position. The close
-    quantity is the EXCHANGE quantity -- 100% of what the venue actually
-    holds -- not a stale local figure.
     """
-    req_side = _close_side_for(pos_side)
-    mode = _detect_position_mode()
-    close_params = _close_order_params(pos_side, mode)
-    if not close_params:
-        _trade_event("CLOSE_FAILED", reason="CLOSE_POSITION_MODE_UNKNOWN")
-        _log_close_outcome(symbol, pos_side, "CLOSE_FAILED", "CLOSE_POSITION_MODE_UNKNOWN")
-        log_execution(f"[CLOSE] {symbol} {pos_side}: position mode unknown on the venue; refusing to guess a close order", "ERROR")
-        return False
+    req_side = "sell" if pos_side == "LONG" else "buy"
     attempt = 0
     while attempt < 3:
         attempt += 1
@@ -4614,19 +4507,16 @@ def _close_full_live_verified(symbol, sym, pos_side, stage, requested_qty):
             return _sync_closed_on_exchange(symbol, ALREADY_CLOSED_ON_EXCHANGE, pos_side,
                                             opposite_exists=snap["opposite_exists"])
         actual_qty = snap["actual_qty"]
-        qty_this = actual_qty  # exchange quantity is authoritative for a full close
+        qty_this = min(float(requested_qty), actual_qty)
         if qty_this <= 0:
             return _sync_closed_on_exchange(symbol, ALREADY_CLOSED_ON_EXCHANGE, pos_side,
                                             opposite_exists=snap["opposite_exists"])
-        if abs(qty_this - float(requested_qty)) > 1e-9:
-            log_execution(f"[CLOSE] {symbol} {pos_side}: venue qty {actual_qty:.6f} != local qty {requested_qty:.6f}; closing the EXCHANGE qty (authoritative)", "WARN")
+        if qty_this < requested_qty - 1e-12:
+            log_execution(f"[CLOSE] {symbol} {pos_side}: local qty {requested_qty:.6f} > venue qty {actual_qty:.6f}; closing venue qty", "WARN")
         qty_precise = float(ex.amount_to_precision(sym, qty_this))
-        if not _close_partial_min_ok(symbol, sym, qty_this):
-            _log_close_outcome(symbol, pos_side, "CLOSE_FAILED", _close_failure_code_for(symbol, sym, qty_this))
-            return False
-        log_execution(f"[CLOSE] verified {symbol} {pos_side} qty={actual_qty:.6f} -> placing market close [{mode}] (attempt {attempt})", "INFO")
+        log_execution(f"[CLOSE] verified {symbol} {pos_side} qty={actual_qty:.6f} -> placing market close (attempt {attempt})", "INFO")
         try:
-            order = safe_api_call(ex.create_order, sym, "market", req_side, qty_precise, params=close_params)
+            order = safe_api_call(ex.create_order, sym, "market", req_side, qty_precise, params=_order_position_params(STATE.get("side"), closing=True, position_id=STATE.get("position_id")))
         except Exception as e:
             if _is_no_position_error(e):
                 # 101205: the requested leg is not on the venue. Re-verify BEFORE
@@ -4669,13 +4559,13 @@ def _close_full_live_verified(symbol, sym, pos_side, stage, requested_qty):
                 "order_id": str(order_id), "ts": time.time(),
             }
             time.sleep(1)
-            confirm = _confirm_exchange_zero(symbol, pos_side)
-            if confirm == "UNKNOWN":
-                _trade_event("CLOSE_STATUS_UNKNOWN", reason="POST_FILL_CONFIRM_UNKNOWN")
-                log_execution(f"[CLOSE] Position status UNKNOWN after fill for {symbol} {pos_side}; refusing local close", "ERROR")
-                _log_close_outcome(symbol, pos_side, "CLOSE_STATUS_UNKNOWN", "POST_FILL_CONFIRM_UNKNOWN")
+            snap2 = _verify_close_target(symbol, pos_side)
+            if snap2["status"] in ("PAUSED", "ERROR"):
+                _trade_event("CLOSE_STATUS_UNKNOWN", reason=snap2["status"])
+                log_execution(f"[CLOSE] Position status UNKNOWN ({snap2['status']}); refusing local close", "ERROR")
+                _log_close_outcome(symbol, pos_side, "CLOSE_STATUS_UNKNOWN", snap2["status"])
                 return False
-            if confirm == "CLOSED":
+            if not snap2["exists"] or snap2["actual_qty"] <= 0:
                 log_execution("[CLOSE] Position confirmed closed (no venue qty)", "SUCCESS")
                 try:
                     _cancel_native_protection(symbol)
@@ -4691,7 +4581,7 @@ def _close_full_live_verified(symbol, sym, pos_side, stage, requested_qty):
                     log_execution(f"[CLOSE] finalize failed: {_e}", "WARN")
                 _log_close_outcome(symbol, pos_side, "CLOSE_EXECUTED", "CONFIRMED_ABSENT")
                 return True
-            log_execution("[CLOSE] Position still has qty after close order. Retrying venue qty.", "WARN")
+            log_execution(f"[CLOSE] Position still has qty {snap2['actual_qty']:.6f} after close order. Retrying venue qty.", "WARN")
         else:
             log_execution(f"[CLOSE] Order did not fill (attempt {attempt})", "ERROR")
             time.sleep(1)
@@ -4833,7 +4723,7 @@ def apply_50_50_profit_engine(df, idx, price, atr, side, entry, state, roe_pct, 
             state["profit_lock_activated"] = True
 
     climax_risk = mom.get("climax_risk", 0)
-    if climax_risk > 50 and state.get("trail_active", False):
+    if climax_risk > 50 and state.get("tp1_hit", False) and state.get("trail_active", False):
         if not state.get("trail_tightened", False):
             state["smart_trail_mult"] = max(0.6, state.get("smart_trail_mult", 1.5) * 0.7)
             state["trail_tightened"] = True
@@ -4845,17 +4735,16 @@ def apply_50_50_profit_engine(df, idx, price, atr, side, entry, state, roe_pct, 
         state["profit_protection_reason"] = "NEGATIVE_MOMENTUM_BEFORE_TP1"
         return "HOLD", state["sl"], state.get("trail_stop", 0.0)
 
-    # Pre-TP1 BE: require meaningful continuation evidence
-    if not state.get("trail_active", False) and roe_pct >= 1.5:
+    # Pre-TP1 protection: BE only. The canonical 50/50 profit engine owns
+    # realization; trailing/runner logic is forbidden until TP1 is confirmed.
+    if not state.get("tp1_hit", False) and roe_pct >= 1.5:
         if continuation_probability > 0.6 or mom.get("trend_expansion", False) or (institutional_bias == side and smart.get("smart_money_dominant", False)):
             state["sl"] = entry
-            if side == "BUY":
-                state["trail_stop"] = price - 1.2 * atr
-            else:
-                state["trail_stop"] = price + 1.2 * atr
-            state["trail_active"] = True
-            log_execution(f"[PPE] {state['symbol']} Stage1: BE SL, trail_active @ 1.2xATR (ROE={roe_pct:.2f}%)", "INFO")
-            return "HOLD", state["sl"], state["trail_stop"]
+            state["profit_protection_reason"] = "CONTINUATION_BEFORE_TP1"
+            state["trail_active"] = False
+            state["trail_stop"] = 0.0
+            log_execution(f"[PPE] {state['symbol']} Pre-TP1: BE protection only; trailing deferred until TP1 (ROE={roe_pct:.2f}%)", "INFO")
+            return "HOLD", state["sl"], 0.0
         else:
             log_execution(f"[PPE] ROE {roe_pct:.1f}% but continuation evidence insufficient; delaying BE", "INFO")
 
@@ -4868,7 +4757,7 @@ def apply_50_50_profit_engine(df, idx, price, atr, side, entry, state, roe_pct, 
             log_execution(f"[PPE] {state['symbol']} Stage3: Runner mode activated (ADX={adx_val:.1f})", "INFO")
 
     trail_mult = state.get("smart_trail_mult", 1.5)
-    if state.get("trail_active", False):
+    if state.get("tp1_hit", False) and state.get("trail_active", False):
         if side == "BUY":
             new_stop = state["max_price"] - trail_mult * atr
             if new_stop > state.get("trail_stop", 0):
@@ -4878,7 +4767,7 @@ def apply_50_50_profit_engine(df, idx, price, atr, side, entry, state, roe_pct, 
             if new_stop < state.get("trail_stop", float('inf')):
                 state["trail_stop"] = new_stop
 
-    if state.get("trail_active", False) and state.get("trail_stop", 0):
+    if state.get("tp1_hit", False) and state.get("trail_active", False) and state.get("trail_stop", 0):
         if (side == "BUY" and price <= state["trail_stop"]) or (side == "SELL" and price >= state["trail_stop"]):
             log_execution(f"[PPE] {state['symbol']} Exit: trailing stop hit at price {price:.4f}", "WARN")
             return "EXIT", state["sl"], state["trail_stop"]
@@ -4913,6 +4802,23 @@ def apply_50_50_profit_engine(df, idx, price, atr, side, entry, state, roe_pct, 
 # No native SL/TP orders are sent.
 
 # ========== LIVE TRADE MANAGER WITH SYNTHETIC PROTECTION (FIXED) ==========
+class _EngineGlobalsProxy:
+    """Dynamic module facade for isolated/reloaded test imports.
+
+    Some BARON tests intentionally load/rebind ``core.engine`` without leaving
+    the executing module registered under ``sys.modules[__name__]``. The
+    execution boundary still needs live access to this module's functions and
+    mutable STATE dictionaries, so resolve attributes from the defining globals
+    instead of relying on registry identity.
+    """
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
 class LiveTradeManager:
     def __init__(self, event_bus, exchange_sync, recovery_guard):
         self.event_bus = event_bus
@@ -4929,7 +4835,14 @@ class LiveTradeManager:
         self.thesis_failure_engine = ThesisFailureEngine()
         self.confidence_engine = ConfidenceEngine()
         self.regime_classifier = MarketRegimeClassifier()
-        self.brain = InstitutionalTradeBrain()
+        _legacy_brain = InstitutionalTradeBrain()
+        self.brain = (UnifiedTradeManagementBrain(_legacy_brain)
+                      if UnifiedTradeManagementBrain is not None else _legacy_brain)
+        if ExecutionService is not None:
+            _execution_core = sys.modules.get(__name__) or _EngineGlobalsProxy()
+            self.execution_service = ExecutionService(_execution_core)
+        else:
+            self.execution_service = None
         # Position Management Engine (Phase 1 advisory layer)
         self.position_profile = None
         self.health_engine = PositionHealthScore()
@@ -4942,6 +4855,25 @@ class LiveTradeManager:
         event_bus.subscribe("reconciled", self._on_reconciled)
         event_bus.subscribe("force_close_local", self._force_close)
         event_bus.subscribe("lifecycle_change", self._set_lifecycle)
+
+    def _execute_action(self, action, *, reason="MANAGEMENT", stage=None, close_price=None, stop=None):
+        """Single Brain -> ExecutionService action path."""
+        action_name = str(getattr(action, "value", action)).upper()
+        try:
+            decision = self.brain.decide_action(action_name, reason=reason)
+            STATE["brain_decision"] = decision.to_dict() if hasattr(decision, "to_dict") else {"action": action_name, "reason": reason}
+            _trade_event("BRAIN_DECISION", decision=STATE["brain_decision"])
+        except Exception:
+            STATE["brain_decision"] = {"action": action_name, "reason": reason, "authority": "UnifiedTradeManagementBrain"}
+        if self.execution_service is None:
+            log_execution("[MANAGEMENT_AUTHORITY] execution service unavailable; action blocked", "ERROR")
+            ok = False
+        else:
+            ok = self.execution_service.act(action_name, self.symbol or STATE.get("current_symbol"),
+                                            reason=reason, stage=stage, close_price=close_price, stop=stop)
+        if action_name in {"EXIT", "FORCE_EXIT", "TP2"} and not ok:
+            STATE["close_verified"] = False
+        return bool(ok)
 
     def _set_lifecycle(self, state):
         # Lifecycle events are accepted only by the manager already bound to
@@ -5001,7 +4933,7 @@ class LiveTradeManager:
             return
         if STATE.get("open") and (not target or STATE.get("current_symbol") == target):
             STATE["close_reason"] = "FORCE_CLOSE_LOCAL"
-            close_position_full()
+            self._execute_action("FORCE_EXIT", reason=STATE["close_reason"], stage="FORCE_EXIT")
             self.lifecycle_state = TradeLifecycleState.CLOSED
             DASHBOARD_STATE["live_trade_mode"] = False
 
@@ -5015,8 +4947,9 @@ class LiveTradeManager:
         self.event_bus.emit("lifecycle_change", TradeLifecycleState.OPEN_PENDING_CONFIRMATION)
         _trade_event("OPENED", side=side, entry_price=entry_price, qty=qty, sl=sl, tp1=tp1, tp2=tp2)
         log_execution(f"[LIFECYCLE] Trade {STATE['trade_id']} open requested for {symbol} {side}", "INFO")
-        if sl and qty:
-            _ensure_native_protection(symbol)
+        # Protection is deliberately installed by the caller only after a fresh
+        # BingX position snapshot has been verified. This prevents an internal
+        # OPENED event from becoming PROTECTED before the venue position exists.
 
     def set_entry_atr(self, entry_atr):
         STATE["entry_atr"] = entry_atr
@@ -5025,11 +4958,17 @@ class LiveTradeManager:
         # shifts. GOLD/OIL mean-revert faster -> tighter initial SL by default.
         asset_class = AssetBehaviorProfile.resolve_asset_class(STATE.get("current_symbol", ""))
         base_sl_mult = AssetBehaviorProfile.get(asset_class).get("sl_mult", 1.6)
-        if STATE["side"] == "BUY":
+        existing_entry_sl = float(STATE.get("entry_dynamic_sl") or STATE.get("sl") or 0.0)
+        if existing_entry_sl > 0:
+            STATE["synthetic_sl"] = existing_entry_sl
+            _sl_source = str(STATE.get("entry_dynamic_sl_basis") or "ENTRY_THESIS")
+            log_execution(f"[SL_DYNAMIC] Initial SL={STATE['synthetic_sl']:.4f} source={_sl_source} entry_ATR={entry_atr:.4f}", "INFO")
+        elif STATE["side"] == "BUY":
             STATE["synthetic_sl"] = STATE["entry"] - entry_atr * base_sl_mult
+            log_execution(f"[SL_FIXED] Initial SL set to {STATE['synthetic_sl']:.4f} based on entry ATR={entry_atr:.4f} (asset={asset_class}, sl_mult={base_sl_mult})", "INFO")
         else:
             STATE["synthetic_sl"] = STATE["entry"] + entry_atr * base_sl_mult
-        log_execution(f"[SL_FIXED] Initial SL set to {STATE['synthetic_sl']:.4f} based on entry ATR={entry_atr:.4f} (asset={asset_class}, sl_mult={base_sl_mult})", "INFO")
+            log_execution(f"[SL_FIXED] Initial SL set to {STATE['synthetic_sl']:.4f} based on entry ATR={entry_atr:.4f} (asset={asset_class}, sl_mult={base_sl_mult})", "INFO")
         if MODE_LIVE and _NATIVE_PROTECTION is not None and _NATIVE_PROTECTION.enabled and STATE.get("remaining_qty", 0) > 0:
             try:
                 _np = _NATIVE_PROTECTION.update(STATE.get("current_symbol", ""), STATE.get("side"), STATE.get("remaining_qty", 0), STATE["synthetic_sl"], _hedge_position_side(STATE.get("side")))
@@ -5319,7 +5258,7 @@ class LiveTradeManager:
                     "confirmed reversal (strong evidence)", confidence, force=True,
                 )
                 STATE["close_reason"] = "REVERSAL"
-                close_position_full()
+                self._execute_action("EXIT", reason=STATE.get("close_reason", "MANAGEMENT"), stage=STATE.get("close_reason", "EXIT"))
                 return True
             elif (reversal_medium or combined_medium) and not STATE.get("tp1_hit", False) and STATE.get("roe_valid", True) and roe > 0:
                 # Medium evidence before TP1 never executes a profit partial.
@@ -5601,247 +5540,244 @@ class LiveTradeManager:
 
         ob = copy.deepcopy(STATE.get("order_block")) if isinstance(STATE.get("order_block"), dict) else None
 
-        _mgmt_cycle = getattr(self, "_management_cycle_id", 0) + 1
-        self._management_cycle_id = _mgmt_cycle
-        _tid = STATE.get("trade_id") or "UNKNOWN"
-
         if now - self.last_heavy_calc_ts >= 5:
+            plus_di, minus_di, adx_now, adx_slope = get_di_components(df_live)
+            if plus_di is None: plus_di = 20.0
+            if minus_di is None: minus_di = 20.0
+            if adx_now is None: adx_now = 20.0
+            if adx_slope is None: adx_slope = 0.0
+
+            pullback_type = trend_engine.analyze_pullback(df_live, side, atr)
+            weak_pullback = (pullback_type == "WEAK_PULLBACK")
+            counter_displacement = 0.0
+            last_candle = df_live.iloc[-1]
+            if side == "SELL" and last_candle['close'] > last_candle['open']:
+                body = abs(last_candle['close'] - last_candle['open'])
+                if body > atr * 0.6:
+                    counter_displacement = body / atr
+            elif side == "BUY" and last_candle['close'] < last_candle['open']:
+                body = abs(last_candle['close'] - last_candle['open'])
+                if body > atr * 0.6:
+                    counter_displacement = body / atr
+            volume_ratio = df_live['volume'].iloc[-1] / df_live['volume'].iloc[-10:-1].mean() if len(df_live) >= 10 else 1.0
+            trend_health = trend_engine.get_trend_health(df_live, side)
+            struct_shift = detect_structure_shift(df_live)
+            structure_aligned = (side == "BUY" and struct_shift == "bullish_shift") or (side == "SELL" and struct_shift == "bearish_shift")
+            # EMA50/EMA200 + session VWAP management context. Confirmed
+            # structure is computed from closed/deep candles; mark_price is used
+            # only for current-location/timing.
+            if GLOBAL_EMA200_VWAP_MANAGER is not None:
+                try:
+                    deep_closed = get_ohlcv_safe(symbol, max(220, INSTITUTIONAL_OHLCV_DEPTH))
+                    if deep_closed is not None and isinstance(deep_closed, pd.DataFrame) and len(deep_closed) >= 200:
+                        STATE["ema_vwap_management"] = GLOBAL_EMA200_VWAP_MANAGER.classify(
+                            deep_closed, side, mark_price, atr
+                        )
+                    else:
+                        STATE["ema_vwap_management"] = {
+                            "available": False, "state": "UNKNOWN",
+                            "ema200_intact": None, "structure_failure": False,
+                            "vwap_reclaim": False, "vwap_supportive": False,
+                        }
+                except Exception as _evm_exc:
+                    STATE["ema_vwap_management"] = {
+                        "available": False, "state": "UNKNOWN",
+                        "ema200_intact": None, "structure_failure": False,
+                        "vwap_reclaim": False, "vwap_supportive": False,
+                        "error": str(_evm_exc),
+                    }
+
+            market_state = {
+                "atr": atr,
+                "adx": adx_now,
+                "adx_slope": adx_slope,
+                "di_plus": plus_di,
+                "di_minus": minus_di,
+                "trend_health": trend_health,
+                "weak_pullback": weak_pullback,
+                "counter_displacement": counter_displacement,
+                "volume_ratio": volume_ratio,
+                "df": df_live,
+                "last_candle": last_candle,
+                "structure_aligned": structure_aligned,
+                "continuation_pressure": 50,
+                "vpa": STATE.get("position_vpa", {})
+            }
+
+            smart_money = SmartMoneyEngine.analyze_smart_money(df_live)
+            momentum = MomentumFlowEngine.analyze_momentum_flow(df_live)
+
+            legacy_regime = self.regime_classifier.classify(df_live, ob)
+            STATE["adx_live"] = adx_now
+            STATE["di_plus_live"] = plus_di
+            STATE["di_minus_live"] = minus_di
+            STATE["smart_money"] = smart_money
+            STATE["momentum_flow"] = momentum
+            STATE["market_regime_legacy"] = legacy_regime
+
+            # ---- Phase-3 (G2/G7): advisory signal stack ----
+            # RSI / MACD-histogram / volume-regime / VWAP context plus the
+            # live OB-zone strength feed the advisory health and the dynamic
+            # rules. They are PERSISTED into STATE so the non-heavy path reuses
+            # the same values (recomputed only every 5s like the rest).
             try:
-                plus_di, minus_di, adx_now, adx_slope = get_di_components(df_live)
-                if plus_di is None: plus_di = 20.0
-                if minus_di is None: minus_di = 20.0
-                if adx_now is None: adx_now = 20.0
-                if adx_slope is None: adx_slope = 0.0
-
-                pullback_type = trend_engine.analyze_pullback(df_live, side, atr)
-                weak_pullback = (pullback_type == "WEAK_PULLBACK")
-                counter_displacement = 0.0
-                last_candle = df_live.iloc[-1]
-                if side == "SELL" and last_candle['close'] > last_candle['open']:
-                    body = abs(last_candle['close'] - last_candle['open'])
-                    if body > atr * 0.6:
-                        counter_displacement = body / atr
-                elif side == "BUY" and last_candle['close'] < last_candle['open']:
-                    body = abs(last_candle['close'] - last_candle['open'])
-                    if body > atr * 0.6:
-                        counter_displacement = body / atr
-                volume_ratio = df_live['volume'].iloc[-1] / df_live['volume'].iloc[-10:-1].mean() if len(df_live) >= 10 else 1.0
-                trend_health = trend_engine.get_trend_health(df_live, side)
-                struct_shift = detect_structure_shift(df_live)
-                structure_aligned = (side == "BUY" and struct_shift == "bullish_shift") or (side == "SELL" and struct_shift == "bearish_shift")
-                market_state = {
-                    "atr": atr,
-                    "adx": adx_now,
-                    "adx_slope": adx_slope,
-                    "di_plus": plus_di,
-                    "di_minus": minus_di,
-                    "trend_health": trend_health,
-                    "weak_pullback": weak_pullback,
-                    "counter_displacement": counter_displacement,
-                    "volume_ratio": volume_ratio,
-                    "df": df_live,
-                    "last_candle": last_candle,
-                    "structure_aligned": structure_aligned,
-                    "continuation_pressure": 50,
-                    "vpa": STATE.get("position_vpa", {})
-                }
-
-                smart_money = SmartMoneyEngine.analyze_smart_money(df_live)
-                momentum = MomentumFlowEngine.analyze_momentum_flow(df_live)
-
-                regime = self.regime_classifier.classify(df_live, ob)
-                trade_state = self.brain.update(smart_money, momentum, adx_now, regime)
-                STATE["trade_state"] = trade_state
-                STATE["smart_trail_mult"] = self.brain.get_trail_multiplier()
-                STATE["delay_tp1"] = self.brain.should_delay_tp1()
-                STATE["adx_live"] = adx_now
-                STATE["di_plus_live"] = plus_di
-                STATE["di_minus_live"] = minus_di
-                STATE["smart_money"] = smart_money
-                STATE["momentum_flow"] = momentum
-                STATE["market_regime"] = regime
-
-                # ---- Phase-3 (G2/G7): advisory signal stack ----
-                # RSI / MACD-histogram / volume-regime / VWAP context plus the
-                # live OB-zone strength feed the advisory health and the dynamic
-                # rules. They are PERSISTED into STATE so the non-heavy path reuses
-                # the same values (recomputed only every 5s like the rest).
-                try:
-                    STATE["position_rsi"] = float(compute_rsi(df_live).iloc[-1])
-                except Exception:
-                    STATE.setdefault("position_rsi", 50.0)
-                try:
-                    _, _, macd_hist = compute_macd(df_live)
-                    STATE["position_macd_hist"] = float(macd_hist.iloc[-1])
-                except Exception:
-                    STATE.setdefault("position_macd_hist", 0.0)
-                try:
-                    STATE["position_vol_state"] = classify_volume(df_live)
-                except Exception:
-                    STATE.setdefault("position_vol_state", "NORMAL")
-                try:
-                    vw = vwap_features(df_live)
-                    STATE["position_vwap_dist"] = float(vw.get("distance", 0.0))
-                    STATE["position_vwap_slope"] = float(vw.get("slope", 0.0))
-                except Exception:
-                    STATE.setdefault("position_vwap_dist", 0.0)
-                    STATE.setdefault("position_vwap_slope", 0.0)
-                try:
-                    zmap = get_smart_zones(STATE["current_symbol"], df_live, None)
-                    zstock = (zmap.get("sell_zones") if side == "SELL" else zmap.get("buy_zones")) or []
-                    if zstock and float(zstock[0].get("strength", 0) or 0) > 0:
-                        STATE["zone_strength_score"] = float(min(100.0, max(0.0, float(zstock[0]["strength"]) * 10.0)))
-                    if _setup_snapshot.get("zone_low") and _setup_snapshot.get("zone_high"):
-                        STATE["zone_info"] = copy.deepcopy(_setup_snapshot.get("zone"))
-                        STATE["zone"] = copy.deepcopy(STATE.get("zone_info"))
-                        STATE["zone_low"] = float(_setup_snapshot["zone_low"])
-                        STATE["zone_high"] = float(_setup_snapshot["zone_high"])
-                        STATE["order_block"] = copy.deepcopy(_setup_snapshot.get("order_block"))
-                        STATE["ob_grade"] = _setup_snapshot.get("ob_grade", STATE.get("ob_grade", "NONE"))
-                        STATE["management_zone_source"] = "ENTRY_CAUSAL_SNAPSHOT"
-                except Exception:
-                    STATE.setdefault("zone_strength_score", 0.0)
-                # VPA is a position-thesis evidence layer. It can corroborate a
-                # failure, but volume alone is never allowed to close a healthy trend.
-                try:
-                    _zlo = STATE.get("zone_low", 0.0) or None
-                    _zhi = STATE.get("zone_high", 0.0) or None
-                    STATE["position_vpa"] = analyze_vpa(
-                        df_live, side, zone_low=_zlo, zone_high=_zhi, atr=atr
-                    ) if analyze_vpa is not None else {}
-                except Exception:
-                    STATE.setdefault("position_vpa", {})
-                # IFVG warning payload for the live position (warning-only engine).
-                STATE["ifvg_state"] = ifvg_warning_payload(side, df_live, atr, mark_price)
-
-                thesis_dict = STATE.get("trade_thesis", {})
-                cont_pressure_score, cont_pressure_reasons = self.continuation_pressure_engine.calculate_pressure(df_live, side, entry, atr, STATE.get("entry_time", time.time()))
-                market_state["continuation_pressure"] = cont_pressure_score
-                continuation_eval = _continuation_engine.evaluate(side, df_live, market_state, thesis_dict)
-                STATE["continuation_probability"] = continuation_eval.continuation_probability
-                STATE["hold_quality"] = continuation_eval.hold_quality
-                STATE["counter_pressure"] = continuation_eval.counter_pressure
-                STATE["reclaim_risk"] = continuation_eval.reclaim_risk
-                STATE["trend_strength"] = continuation_eval.trend_strength
-                STATE["continuation_reasons"] = continuation_eval.reasons
-                STATE["continuation_pressure"] = cont_pressure_score
-            except Exception as _phase1_err:
-                log_execution(
-                    f"[HEAVY_CALC] cycle={_mgmt_cycle} symbol={symbol} trade_id={_tid} "
-                    f"stage=PHASE1_CORE_ANALYTICS exc_type={type(_phase1_err).__name__} "
-                    f"exc={_phase1_err} ts={time.time():.3f}\n{traceback.format_exc()}",
-                    "WARN",
-                )
-                adx_now = STATE.get("adx_live", 20.0)
-                plus_di = STATE.get("di_plus_live", 20.0)
-                minus_di = STATE.get("di_minus_live", 20.0)
-                smart_money = STATE.get("smart_money", {})
-                momentum = STATE.get("momentum_flow", {})
-                trade_state = STATE.get("trade_state", "RANGE_CHOP")
-                trend_health = STATE.get("advisory_trend_health", 5.0)
-                struct_shift = STATE.get("advisory_struct_shift", None)
-                structure_aligned = STATE.get("advisory_structure_aligned", False)
-                continuation_eval = ContinuationEvaluation(
-                    continuation_probability=STATE.get("continuation_probability", 0.5),
-                    trend_strength=STATE.get("trend_strength", 0.5),
-                    exhaustion_probability=0.0,
-                    reclaim_risk=STATE.get("reclaim_risk", 0.0),
-                    counter_pressure=STATE.get("counter_pressure", 0.0),
-                    confidence=0.5,
-                    reasons=STATE.get("continuation_reasons", []),
-                    should_hold=STATE.get("continuation_probability", 0.5) >= 0.62,
-                    hold_quality=STATE.get("hold_quality", "UNKNOWN"),
-                )
-                tp1_hold_score = STATE.get("tp1_hold_score", 10)
-                exit_warning = STATE.get("exit_warning", 0)
-                cont_pressure_score = STATE.get("continuation_pressure", 50)
-                adx_slope = 0.0
-                di_spread_change = 0.0
-                failure_score = STATE.get("thesis_failure_score", 0)
-                thesis_dict = STATE.get("trade_thesis", {})
-                if not isinstance(thesis_dict, dict):
-                    thesis_dict = {}
-                market_state = {
-                    "atr": atr,
-                    "adx": adx_now,
-                    "adx_slope": adx_slope,
-                    "di_plus": plus_di,
-                    "di_minus": minus_di,
-                    "trend_health": trend_health,
-                    "weak_pullback": False,
-                    "counter_displacement": 0.0,
-                    "volume_ratio": 1.0,
-                    "df": df_live,
-                    "last_candle": df_live.iloc[-1] if isinstance(df_live, pd.DataFrame) and len(df_live) else {},
-                    "structure_aligned": structure_aligned,
-                    "continuation_pressure": cont_pressure_score,
-                    "vpa": STATE.get("position_vpa", {}),
-                }
-
+                STATE["position_rsi"] = float(compute_rsi(df_live).iloc[-1])
+            except Exception:
+                STATE.setdefault("position_rsi", 50.0)
             try:
-                failed, failure_reasons, failure_score = self.thesis_failure_engine.evaluate_failure(thesis_dict, market_state, mark_price, entry, side)
-                STATE["thesis_failure_score"] = failure_score
-            except Exception as _phase2_err:
-                log_execution(
-                    f"[HEAVY_CALC] cycle={_mgmt_cycle} symbol={symbol} trade_id={_tid} "
-                    f"stage=PHASE2_THESIS_FAILURE exc_type={type(_phase2_err).__name__} "
-                    f"exc={_phase2_err} ts={time.time():.3f}\n{traceback.format_exc()}",
-                    "WARN",
-                )
+                _, _, macd_hist = compute_macd(df_live)
+                STATE["position_macd_hist"] = float(macd_hist.iloc[-1])
+            except Exception:
+                STATE.setdefault("position_macd_hist", 0.0)
+            try:
+                STATE["position_vol_state"] = classify_volume(df_live)
+            except Exception:
+                STATE.setdefault("position_vol_state", "NORMAL")
+            try:
+                vw = vwap_features(df_live)
+                STATE["position_vwap_dist"] = float(vw.get("distance", 0.0))
+                STATE["position_vwap_slope"] = float(vw.get("slope", 0.0))
+            except Exception:
+                STATE.setdefault("position_vwap_dist", 0.0)
+                STATE.setdefault("position_vwap_slope", 0.0)
+            try:
+                zmap = get_smart_zones(STATE["current_symbol"], df_live, None)
+                zstock = (zmap.get("sell_zones") if side == "SELL" else zmap.get("buy_zones")) or []
+                if zstock and float(zstock[0].get("strength", 0) or 0) > 0:
+                    STATE["zone_strength_score"] = float(min(100.0, max(0.0, float(zstock[0]["strength"]) * 10.0)))
+                if _setup_snapshot.get("zone_low") and _setup_snapshot.get("zone_high"):
+                    STATE["zone_info"] = copy.deepcopy(_setup_snapshot.get("zone"))
+                    STATE["zone"] = copy.deepcopy(STATE.get("zone_info"))
+                    STATE["zone_low"] = float(_setup_snapshot["zone_low"])
+                    STATE["zone_high"] = float(_setup_snapshot["zone_high"])
+                    STATE["order_block"] = copy.deepcopy(_setup_snapshot.get("order_block"))
+                    STATE["ob_grade"] = _setup_snapshot.get("ob_grade", STATE.get("ob_grade", "NONE"))
+                    STATE["management_zone_source"] = "ENTRY_CAUSAL_SNAPSHOT"
+            except Exception:
+                STATE.setdefault("zone_strength_score", 0.0)
+            # VPA is a position-thesis evidence layer. It can corroborate a
+            # failure, but volume alone is never allowed to close a healthy trend.
+            try:
+                _zlo = STATE.get("zone_low", 0.0) or None
+                _zhi = STATE.get("zone_high", 0.0) or None
+                STATE["position_vpa"] = analyze_vpa(
+                    df_live, side, zone_low=_zlo, zone_high=_zhi, atr=atr
+                ) if analyze_vpa is not None else {}
+            except Exception:
+                STATE.setdefault("position_vpa", {})
+            # IFVG warning payload for the live position (warning-only engine).
+            STATE["ifvg_state"] = ifvg_warning_payload(side, df_live, atr, mark_price)
+
+            _v2_live = STATE.get("entry_intelligence_v2") if isinstance(STATE.get("entry_intelligence_v2"), dict) else {}
+            _v2_event = _v2_live.get("liquidity_event") or {}
+
+            # Canonical market regime: this is the single state source used by
+            # the management brain. The old classifier is retained only as a
+            # diagnostic compatibility field and can no longer leave the live
+            # trade in a stale RANGE_CHOP state while the market is expanding.
+            try:
+                _ms_structure = {
+                    "direction": "BULLISH" if side == "BUY" and structure_aligned else (
+                        "BEARISH" if side == "SELL" and structure_aligned else "UNKNOWN"),
+                    "quality": 1.0 if structure_aligned else 0.0,
+                    "mss": bool(structure_aligned),
+                    "bos": bool(structure_aligned),
+                }
+                _liq_detected = bool(_v2_event.get("detected") or _v2_event.get("reclaimed"))
+                _ms_liq = {
+                    # Never manufacture a BUY/SELL liquidity direction merely
+                    # because the open position has that side. Direction is only
+                    # meaningful when an actual liquidity event exists.
+                    "direction": side if _liq_detected else "UNKNOWN",
+                    "detected": _liq_detected,
+                    "sweep": bool(_v2_event.get("detected")),
+                    "reclaimed": bool(_v2_event.get("reclaimed")),
+                    "quality": float(_v2_event.get("quality", 0.0) or 0.0),
+                }
+                _canonical_ms = GLOBAL_MARKET_REGIME_ENGINE.analyze(
+                    df_live, structure=_ms_structure, liquidity=_ms_liq,
+                    vpa=STATE.get("position_vpa", {}),
+                    previous_state=STATE.get("market_state", {}).get("state") if isinstance(STATE.get("market_state"), dict) else None,
+                ).to_dict() if GLOBAL_MARKET_REGIME_ENGINE is not None else {}
+                STATE["market_state"] = _canonical_ms
+                STATE["market_regime"] = str(_canonical_ms.get("state", "UNKNOWN"))
+            except Exception as _ms_exc:
+                _canonical_ms = STATE.get("market_state", {}) if isinstance(STATE.get("market_state"), dict) else {}
+                STATE["market_regime"] = str(_canonical_ms.get("state", "UNKNOWN"))
+                log_execution(f"[MARKET_STATE] canonical analysis error: {_ms_exc}", "WARN")
+
+            trade_state = self.brain.update(
+                smart_money, momentum, adx_now, legacy_regime,
+                market_state=_canonical_ms
+            )
+            STATE["trade_state"] = trade_state
+            STATE["smart_trail_mult"] = self.brain.get_trail_multiplier()
+            STATE["delay_tp1"] = self.brain.should_delay_tp1()
+
+            thesis_dict = STATE.get("trade_thesis", {})
+            cont_pressure_score, cont_pressure_reasons = self.continuation_pressure_engine.calculate_pressure(df_live, side, entry, atr, STATE.get("entry_time", time.time()))
+            market_state["continuation_pressure"] = cont_pressure_score
+            continuation_eval = _continuation_engine.evaluate(side, df_live, market_state, thesis_dict)
+            STATE["continuation_probability"] = continuation_eval.continuation_probability
+            STATE["hold_quality"] = continuation_eval.hold_quality
+            STATE["counter_pressure"] = continuation_eval.counter_pressure
+            STATE["reclaim_risk"] = continuation_eval.reclaim_risk
+            STATE["trend_strength"] = continuation_eval.trend_strength
+            STATE["continuation_reasons"] = continuation_eval.reasons
+            STATE["continuation_pressure"] = cont_pressure_score
+
+            failed, failure_reasons, failure_score = self.thesis_failure_engine.evaluate_failure(thesis_dict, market_state, mark_price, entry, side)
+            # An EMA50/VWAP pullback is not a thesis failure while EMA200 and
+            # structure remain intact. This prevents a normal correction from
+            # being promoted to an EXIT solely because live price dipped through
+            # EMA50. Independent emergency/failure states remain authoritative.
+            _evm_ctx = STATE.get("ema_vwap_management") or {}
+            _evm_hold = (
+                bool(_evm_ctx.get("ema200_intact"))
+                and not bool(_evm_ctx.get("structure_failure"))
+                and str(_evm_ctx.get("state", "")).upper() in
+                    {"HEALTHY_PULLBACK", "EMA50_BREACH", "VWAP_RETEST"}
+            )
+            if failed and _evm_hold:
+                STATE["thesis_failure_raw_score"] = failure_score
+                failure_score = min(float(failure_score), 35.0)
                 failed = False
-                failure_reasons = []
-                failure_score = STATE.get("thesis_failure_score", 0)
-
+                failure_reasons = list(failure_reasons or []) + ["EMA_VWAP_HEALTHY_PULLBACK"]
+                STATE["thesis_failure_temporarily_suppressed"] = True
+            else:
+                STATE["thesis_failure_temporarily_suppressed"] = False
+                STATE["thesis_failure_raw_score"] = failure_score
+            STATE["thesis_failure_score"] = failure_score
             if failed:
-                log_execution(f"[THESIS_FAILURE] Thesis failed for {symbol}: {failure_reasons}", "WARN")
-                if STATE.get("roe_valid", True) and roe > 0:
-                    _thcomm = _protection_commit(
-                        symbol, side, STATE.get("remaining_qty", STATE.get("qty", 0.0)),
-                        entry, reason="THESIS_FAILURE_PROFIT_PROTECTED")
-                    if str(_thcomm.get("status", "")).upper() in ("PROTECTED", "PAPER_SYNTHETIC"):
-                        log_execution("[THESIS_FAILURE] Profit protected at breakeven; no pre-TP1 partial", "WARN")
-                else:
-                    STATE["close_reason"] = "THESIS_FAILURE"
-                    close_position_full()
-                    self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
-                    DASHBOARD_STATE["live_trade_mode"] = False
-                    return
+                # Evidence only. The UnifiedTradeManagementBrain below is the
+                # sole authority that may turn thesis failure into an action.
+                log_execution(f"[THESIS_FAILURE] evidence for {symbol}: {failure_reasons}", "WARN")
 
-            try:
-                old_conf = STATE.get("current_confidence", 50.0)
-                di_spread_change = (plus_di - minus_di) - STATE.get("prev_di_spread", 0)
-                new_conf = self.confidence_engine.update_live_confidence(old_conf, cont_pressure_score, failure_score, adx_slope, di_spread_change)
-                new_conf = ConfidenceEngine.apply_institutional_modifiers(new_conf, smart_money, momentum, continuation_eval.continuation_probability * 100)
-                STATE["current_confidence"] = new_conf
-                STATE["prev_di_spread"] = plus_di - minus_di
+            old_conf = STATE.get("current_confidence", 50.0)
+            di_spread_change = (plus_di - minus_di) - STATE.get("prev_di_spread", 0)
+            new_conf = self.confidence_engine.update_live_confidence(old_conf, cont_pressure_score, failure_score, adx_slope, di_spread_change)
+            new_conf = ConfidenceEngine.apply_institutional_modifiers(new_conf, smart_money, momentum, continuation_eval.continuation_probability * 100)
+            STATE["current_confidence"] = new_conf
+            STATE["prev_di_spread"] = plus_di - minus_di
 
-                rejection_bull, _ = RejectionIntelligence.is_bullish_rejection(df_live, atr)
-                rejection_bear, _ = RejectionIntelligence.is_bearish_rejection(df_live, atr)
-                rejection_detected = (side == "BUY" and rejection_bull) or (side == "SELL" and rejection_bear)
-                failed_breakout = (trade_state == "FAKE_BREAKOUT") or (abs(continuation_eval.continuation_probability - 0.5) < 0.1 and roe < 2)
+            rejection_bull, _ = RejectionIntelligence.is_bullish_rejection(df_live, atr)
+            rejection_bear, _ = RejectionIntelligence.is_bearish_rejection(df_live, atr)
+            rejection_detected = (side == "BUY" and rejection_bull) or (side == "SELL" and rejection_bear)
+            failed_breakout = (trade_state == "FAKE_BREAKOUT") or (abs(continuation_eval.continuation_probability - 0.5) < 0.1 and roe < 2)
 
-                tp1_hold_score = self._compute_tp1_hold_score(
-                    smart_money, momentum, adx_now, adx_slope, trade_state,
-                    continuation_eval, smart_money.get("distribution_risk", 0),
-                    rejection_detected, failed_breakout, roe
-                )
-                STATE["tp1_hold_score"] = tp1_hold_score
+            tp1_hold_score = self._compute_tp1_hold_score(
+                smart_money, momentum, adx_now, adx_slope, trade_state,
+                continuation_eval, smart_money.get("distribution_risk", 0),
+                rejection_detected, failed_breakout, roe
+            )
+            STATE["tp1_hold_score"] = tp1_hold_score
 
-                exit_warning = self._compute_institutional_exit_warning(
-                    smart_money, momentum, smart_money.get("distribution_risk", 0),
-                    continuation_eval.continuation_probability, rejection_detected,
-                    adx_slope, di_spread_change
-                )
-                STATE["exit_warning"] = exit_warning
-            except Exception as _phase3_err:
-                log_execution(
-                    f"[HEAVY_CALC] cycle={_mgmt_cycle} symbol={symbol} trade_id={_tid} "
-                    f"stage=PHASE3_CONFIDENCE_GUARDS exc_type={type(_phase3_err).__name__} "
-                    f"exc={_phase3_err} ts={time.time():.3f}\n{traceback.format_exc()}",
-                    "WARN",
-                )
-                tp1_hold_score = STATE.get("tp1_hold_score", 10)
-                exit_warning = STATE.get("exit_warning", 0)
+            exit_warning = self._compute_institutional_exit_warning(
+                smart_money, momentum, smart_money.get("distribution_risk", 0),
+                continuation_eval.continuation_probability, rejection_detected,
+                adx_slope, di_spread_change
+            )
+            STATE["exit_warning"] = exit_warning
 
             # Persist advisory inputs so the non-heavy path can reuse them too.
             STATE["advisory_trend_health"] = trend_health
@@ -5933,231 +5869,260 @@ class LiveTradeManager:
                 "INFO"
             )
 
-        if self.brain.should_aggressive_profit_lock() and not STATE.get("profit_lock_activated", False):
-            log_execution(f"[PROFIT_LOCK] Aggressive profit lock triggered (state={trade_state})", "WARN")
-            if STATE.get("tp1_hit", False):
-                STATE["profit_lock_activated"] = True
-            elif STATE.get("roe_valid", True) and roe > 0:
-                _defcomm = _protection_commit(
-                    symbol, side, STATE.get("remaining_qty", STATE.get("qty", 0.0)),
-                    entry, reason="DEFENSIVE_BEFORE_TP1")
-                if str(_defcomm.get("status", "")).upper() in ("PROTECTED", "PAPER_SYNTHETIC"):
-                    _trade_event("PROFIT_PROTECTION", lock_price=entry, reason="DEFENSIVE_BEFORE_TP1_NO_PARTIAL")
+        # Profit protection is evidence for the Brain; no direct protection
+        # order is allowed here. This prevents a second management authority.
 
-        if self.brain.should_hard_exit():
-            log_execution(f"[HARD_EXIT] Hard exit triggered (state={trade_state})", "ERROR")
-            STATE["close_reason"] = "HARD_EXIT"
-            close_position_full()
-            self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
-            DASHBOARD_STATE["live_trade_mode"] = False
-            return
+        # =====================================================================
+        # SINGLE RUNTIME MANAGEMENT AUTHORITY
+        # =====================================================================
+        # All previous management branches (legacy hard-exit, PPE, dynamic
+        # reversal/exhaustion, independent trailing and final SL checks) are
+        # now reduced to evidence generation. Only the UnifiedTradeManagementBrain
+        # chooses an action. ExecutionService remains the sole action gateway.
 
-        entry_atr = STATE.get("entry_atr", atr)
+        entry_atr = max(float(STATE.get("entry_atr", atr) or atr), 1e-9)
         base_sl_mult = 1.6
         if smart_money.get("distribution_risk", 0) > 65:
             base_sl_mult = 0.8
         elif smart_money.get("distribution_risk", 0) > 45:
             base_sl_mult = 1.2
-        if side == "BUY":
-            synthetic_sl = entry - entry_atr * base_sl_mult
-            if STATE.get("tp1_hit", False) or STATE.get("be_ratchet_active", False):
-                synthetic_sl = max(synthetic_sl, entry)
-        else:
-            synthetic_sl = entry + entry_atr * base_sl_mult
-            if STATE.get("tp1_hit", False) or STATE.get("be_ratchet_active", False):
-                synthetic_sl = min(synthetic_sl, entry)
-        # F3/F5: a transient or older recompute proposal must never wipe a newer
-        # confirmed protection. Clamp to the last exchange-confirmed SL when the
-        # recomputed base is less protective.
-        _confirmed_clamp = float(STATE.get("last_confirmed_sl", 0.0) or 0.0)
-        if _confirmed_clamp > 0 and not _is_more_protective(side, synthetic_sl, _confirmed_clamp):
-            synthetic_sl = _confirmed_clamp
+        legacy_sl = entry - entry_atr * base_sl_mult if side == "BUY" else entry + entry_atr * base_sl_mult
+        if STATE.get("tp1_hit", False) or STATE.get("be_ratchet_active", False):
+            legacy_sl = max(legacy_sl, entry) if side == "BUY" else min(legacy_sl, entry)
+
+        _candidate_sl = float(legacy_sl)
+        _candidate_basis = "LEGACY_ATR"
+        _v2 = STATE.get("entry_intelligence_v2") or {}
+        _v2_thesis = _v2.get("thesis") or {}
+        _v2_event = _v2.get("liquidity_event") or {}
+        if propose_dynamic_sl is not None and str(_v2.get("decision", "")).upper() == "APPROVE":
+            _inv = _v2_thesis.get("invalidation")
+            if _inv is not None:
+                try:
+                    _vol_mult = max(0.5, min(1.5, float(atr) / entry_atr))
+                    _proposal = propose_dynamic_sl(
+                        side=side, entry=entry, atr=atr, invalidation=float(_inv),
+                        liquidity_level=_v2_event.get("level"),
+                        liquidity_quality=float(_v2_event.get("quality", 0.0) or 0.0),
+                        volatility_multiplier=_vol_mult,
+                    )
+                    _candidate_sl = float(_proposal["sl"])
+                    _candidate_basis = str(_proposal.get("basis") or "THESIS_INVALIDATION")
+                except Exception:
+                    pass
         _old_synth_sl = float(STATE.get("synthetic_sl", 0.0) or 0.0)
-        STATE["synthetic_sl"] = synthetic_sl
-        if (MODE_LIVE and _NATIVE_PROTECTION is not None and
-                _NATIVE_PROTECTION.enabled and abs(synthetic_sl - _old_synth_sl) > 1e-12 and
-                STATE.get("remaining_qty", 0) > 0):
-            try:
-                _np = _NATIVE_PROTECTION.update(symbol, side, STATE.get("remaining_qty", 0.0), synthetic_sl, _hedge_position_side(side))
-                _set_protection_status(_np.get("status", "UNPROTECTED"), _np.get("sl_order_id"), _np.get("reason"))
-                _trade_event("PROTECTION_UPDATE", stop=synthetic_sl, status=_np.get("status"))
-            except Exception as _np_exc:
-                _set_protection_status("UNPROTECTED", reason=str(_np_exc))
-        if (side == "BUY" and mark_price <= synthetic_sl) or (side == "SELL" and mark_price >= synthetic_sl):
-            log_execution(f"[SYNTHETIC_SL] Hit at {mark_price:.4f} (SL={synthetic_sl:.4f})", "WARN")
-            STATE["close_reason"] = "INTERNAL_SL"
-            close_position_full()
-            self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
-            DASHBOARD_STATE["live_trade_mode"] = False
-            return
+        _confirmed_clamp = float(STATE.get("last_confirmed_sl", 0.0) or 0.0)
+        if ratchet_stop is not None:
+            _candidate_sl = ratchet_stop(side, _confirmed_clamp or _old_synth_sl, _candidate_sl)
+        if _confirmed_clamp > 0 and not _is_more_protective(side, _candidate_sl, _confirmed_clamp):
+            _candidate_sl = _confirmed_clamp
 
-        # Guaranteed profit-protection ratchet: once ROE is meaningfully
-        # positive, breakeven protection is independent of TP1 scoring. It never
-        # marks TP1 as done and it only moves the stop in the protective direction.
-        if STATE.get("roe_valid", True) and roe >= float(os.getenv("BREAKEVEN_RATCHET_ROE", "2.0")):
-            _old_sl = float(STATE.get("synthetic_sl", STATE.get("sl", 0.0)) or 0.0)
-            _be_sl = entry
-            _ratchet_need = (side == "BUY" and _old_sl < _be_sl) or \
-                            (side == "SELL" and (_old_sl <= 0 or _old_sl > _be_sl))
-            if _ratchet_need:
-                _be_committed = _protection_commit(
-                    symbol, side, STATE.get("remaining_qty", STATE.get("qty", 0.0)),
-                    _be_sl, reason="BREAKEVEN_RATCHET")
-                if str(_be_committed.get("status", "")).upper() in ("PROTECTED", "PAPER_SYNTHETIC"):
-                    STATE["be_ratchet_active"] = True
-                    _trade_event("BREAKEVEN_RATCHET", roe=roe, stop=STATE["synthetic_sl"])
-        # ---- Canonical TP authority -----------------------------------------
-        # Every TP order is submitted and verified by apply_profit_engine().
-        # This prevents the manager from having a second independent TP path.
-        STATE["mark_price"] = mark_price
-        tp_action = apply_profit_engine(symbol, mark_price, df_live, len(df_live) - 1, STATE)
-        if tp_action == "TP2":
-            self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
-            DASHBOARD_STATE["live_trade_mode"] = False
-            return
-        if tp_action == "TP1":
-            if SINGLE_TP_ENABLED and STATE.get("close_reason") == "SINGLE_TP":
-                # Single TP closes the FULL position on the first take-profit
-                # touch: this is a terminal close, not a 50% scale-out. Emit the
-                # lifecycle CLOSED transition exactly like the legacy TP2 path so
-                # the adoption/sync loop never sees a lingering context.
-                self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
-                DASHBOARD_STATE["live_trade_mode"] = False
-                return
-            self._update_peak_profit(roe, mark_price)
-            _trade_event("PROFIT_LOCK", lock_price=entry, reason="TP1_VERIFIED")
+        # Target-touch evidence is wick-aware and uses the immutable canonical
+        # TP levels. No separate profit engine is allowed to execute these.
+        def _target_touched(target):
+            target = float(target or 0.0)
+            if target <= 0:
+                return False
+            if side == "BUY":
+                return mark_price >= target or float(df_live["high"].iloc[-1]) >= target
+            return mark_price <= target or float(df_live["low"].iloc[-1]) <= target
 
-        if STATE.get("tp1_hit", False):
+        tp1_target = float(STATE.get("tp1_price", STATE.get("synthetic_tp1", 0.0)) or 0.0)
+        tp2_target = float(STATE.get("tp2_price", STATE.get("synthetic_tp2", 0.0)) or 0.0)
+        tp1_touched = (not STATE.get("tp1_hit", False)) and _target_touched(tp1_target)
+        tp2_touched = bool(STATE.get("tp1_hit", False)) and (not STATE.get("tp2_hit", False)) and _target_touched(tp2_target)
+
+        # Confirmed thesis failure / hard-state evidence. EMA50/VWAP alone are
+        # intentionally excluded; EMA200 + structure failure remains the strong
+        # invalidation signature.
+        evm_ctx = STATE.get("ema_vwap_management") or {}
+        _ema200_value = float(evm_ctx.get("ema200", 0.0) or 0.0)
+        _price_wrong_side_200 = (
+            (_ema200_value > 0 and side == "BUY" and mark_price < _ema200_value)
+            or (_ema200_value > 0 and side == "SELL" and mark_price > _ema200_value)
+        )
+        _ema200_distance_atr = (abs(mark_price - _ema200_value) / max(float(atr), 1e-9)) if _ema200_value > 0 else 0.0
+        _ema200_failure_economically_confirmed = (
+            (roe < -0.25) or
+            (roe > 0.0 and _ema200_distance_atr >= 0.5)
+        )
+        ema200_failure = (evm_ctx.get("state") == "THESIS_FAILURE" and
+                          evm_ctx.get("ema200_intact") is False and
+                          evm_ctx.get("structure_failure") is True and
+                          _price_wrong_side_200 and
+                          _ema200_failure_economically_confirmed)
+        strong_negative_failure = bool(
+            failed and roe < 0 and float(failure_score or 0.0) >= float(os.getenv("THESIS_FAILURE_EXIT_SCORE", "65"))
+        )
+        confirmed_failure_exit = bool(
+            failed and not STATE.get("thesis_failure_temporarily_suppressed", False) and
+            (strong_negative_failure or ema200_failure)
+        )
+        hard_state = trade_state in ("PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION")
+        confirmed_failure_exit = confirmed_failure_exit or hard_state or ema200_failure
+
+        dist_risk = float(smart_money.get("distribution_risk", 0) or 0)
+        exhaustion_risk = float(momentum.get("exhaustion_risk", 0) or 0)
+        pre_tp1_protect = (
+            not STATE.get("tp1_hit", False) and STATE.get("roe_valid", True) and roe > 0 and
+            ((dist_risk > 45 and roe >= float(os.getenv("PROFIT_LOCK_MIN_ROE", "1.0"))) or
+             (exhaustion_risk > 65) or
+             (STATE.get("position_action") in ("PARTIAL", "PROTECT_PROFIT") and continuation_eval.continuation_probability < 0.5))
+        )
+
+        # Build exactly one runner trail candidate. It is only considered after
+        # TP1 is exchange-verified, and the final stop hit is evaluated before
+        # the trail update so a breached trail cannot be overwritten.
+        trail_candidate = float(STATE.get("trail_stop", 0.0) or 0.0)
+        trail_update = False
+        trail_hit = False
+        if STATE.get("tp1_hit", False) and STATE.get("roe_valid", True):
             peak_roe = STATE.get("peak_roe", roe)
             drawdown = STATE.get("drawdown_from_peak", 0.0)
             base_trail_mult = self.brain.get_trail_multiplier()
-            adjusted_mult = self._apply_runner_defense(roe, peak_roe, drawdown, exit_warning,
-                                                        continuation_eval.continuation_probability,
-                                                        base_trail_mult, trade_state)
-            STATE["smart_trail_mult"] = adjusted_mult
+            adjusted_mult = self._apply_runner_defense(
+                roe, peak_roe, drawdown, exit_warning,
+                continuation_eval.continuation_probability, base_trail_mult, trade_state)
+            trail_mult = adjusted_mult
+            if dist_risk > 45:
+                trail_mult *= 0.7
+            if momentum.get("momentum_health", 50) < 30:
+                trail_mult *= 0.8
+            if continuation_eval.continuation_probability > 0.8:
+                trail_mult *= 1.2
+            asset_cfg_run = AssetBehaviorProfile.get(STATE.get("position_asset_class") or "CRYPTO")
+            runner_bias = float(asset_cfg_run.get("runner_bias", 1.0))
+            STATE["position_runner_bias"] = runner_bias
+            trail_mult = max(0.5, min(4.5, trail_mult * (0.9 + 0.2 * runner_bias)))
+            asset_cfg = AssetBehaviorProfile.get(STATE.get("position_asset_class") or "CRYPTO")
+            trail_activate_roe = float(asset_cfg.get("roe_trail_activate", 1.5))
+            asset_trail_base = float(asset_cfg.get("trail_mult", 3.0))
+            trail_mult = trail_mult * max(0.55, min(1.0, asset_trail_base / 3.0))
+            if roe > trail_activate_roe:
+                proposed_trail = mark_price - trail_mult * atr if side == "BUY" else mark_price + trail_mult * atr
+                if side == "BUY":
+                    trail_candidate = max(float(STATE.get("trail_stop", 0.0) or 0.0), proposed_trail)
+                else:
+                    old_trail = float(STATE.get("trail_stop", 0.0) or 0.0)
+                    trail_candidate = min(old_trail if old_trail > 0 else proposed_trail, proposed_trail)
+                trail_update = abs(trail_candidate - float(STATE.get("trail_stop", 0.0) or 0.0)) > 1e-12
+                trail_hit = (side == "BUY" and trail_candidate > 0 and mark_price <= trail_candidate) or (side == "SELL" and trail_candidate > 0 and mark_price >= trail_candidate)
+                STATE["smart_trail_mult"] = trail_mult
 
-        trail_mult = STATE.get("smart_trail_mult", 1.5)
-        if smart_money.get("distribution_risk", 0) > 45:
-            trail_mult *= 0.7
-        if momentum.get("momentum_health", 50) < 30:
-            trail_mult *= 0.8
-        if continuation_eval.continuation_probability > 0.8:
-            trail_mult *= 1.2
+        old_sl = float(STATE.get("synthetic_sl", STATE.get("sl", 0.0)) or 0.0)
+        candidate_more_protective = (_candidate_sl > old_sl + 1e-12) if side == "BUY" else (_candidate_sl < old_sl - 1e-12)
+        be_needed = STATE.get("roe_valid", True) and roe >= float(os.getenv("BREAKEVEN_RATCHET_ROE", "2.0")) and (
+            (side == "BUY" and old_sl < entry) or (side == "SELL" and (old_sl <= 0 or old_sl > entry))
+        )
+        stop_hit_now = (side == "BUY" and mark_price <= max(old_sl, _candidate_sl)) or (side == "SELL" and mark_price >= min(old_sl if old_sl > 0 else _candidate_sl, _candidate_sl))
 
-        # ---- Phase-3 (G3): runner_bias activation ----
-        # The asset-class runner bias (defined but previously unused) tunes how
-        # much room a runner keeps while in runner mode: high-bias assets
-        # (CRYPTO 1.0) keep a wider trail to let the move run; low-bias assets
-        # (GOLD/OIL 0.6, NEWS 0.5) bank profit sooner with a tighter trail.
-        asset_cfg_run = AssetBehaviorProfile.get(STATE.get("position_asset_class") or "CRYPTO")
-        runner_bias = float(asset_cfg_run.get("runner_bias", 1.0))
-        STATE["position_runner_bias"] = runner_bias
-        if STATE.get("runner_mode", False) and runner_bias:
-            trail_mult = min(4.5, trail_mult * (0.9 + 0.2 * runner_bias))
+        decision = self.brain.evaluate({
+            "symbol": symbol, "side": side, "entry": entry, "roe": roe,
+            "roe_valid": STATE.get("roe_valid", True), "tp1_hit": STATE.get("tp1_hit", False),
+            "tp1_touched": tp1_touched, "tp2_touched": tp2_touched,
+            "force_exit": False, "confirmed_failure_exit": confirmed_failure_exit,
+            "failure_reason": "EMA200_STRUCTURE_FAILURE" if ema200_failure else ("THESIS_FAILURE" if failed else "HARD_MARKET_FAILURE"),
+            "stop_hit": stop_hit_now, "stop_reason": "PROTECTIVE_SL_HIT",
+            "pre_tp1_protect": pre_tp1_protect,
+            "protect_reason": "DISTRIBUTION_OR_EXHAUSTION_PROTECTION",
+            "be_needed": be_needed, "be_reason": "BREAKEVEN_RATCHET",
+            "trail_hit": trail_hit, "trail_update": trail_update, "trail_stop": trail_candidate,
+            "trail_reason": "RUNNER_TRAIL",
+            "candidate_sl": _candidate_sl, "candidate_sl_more_protective": candidate_more_protective,
+            "candidate_sl_reason": f"DYNAMIC_{_candidate_basis}",
+            "hold_reason": f"STATE={trade_state} continuation={continuation_eval.continuation_probability:.2f}",
+        })
+        STATE["brain_decision"] = decision.to_dict()
+        STATE["management_action"] = decision.action
+        STATE["management_reason"] = decision.reason
+        STATE["dynamic_sl_basis"] = _candidate_basis
+        log_execution(
+            f"[MANAGEMENT_BRAIN] {symbol} {side} action={decision.action} "
+            f"stage={decision.stage} reason={decision.reason}",
+            "INFO", debounce_key=f"brain_{symbol}", debounce_sec=5,
+        )
+        _trade_event("BRAIN_DECISION", decision=STATE["brain_decision"])
 
-        trail_mult = max(0.5, min(4.5, trail_mult))
-
-        # ---- Dynamic trailing (Phase 2): asset-class + trade_type aware ------
-        # The trailing stop no longer activates at a fixed 1.5% ROE. It uses the
-        # asset-class activation threshold (GOLD/OIL activate earlier ~0.8%;
-        # CRYPTO keeps the legacy 1.5%) and REVERSAL trades trail even earlier
-        # since they must be captured quickly. The base multiplier also blends
-        # the asset-class behaviour (tight assets get a tighter trail).
-        asset_cfg = AssetBehaviorProfile.get(STATE.get("position_asset_class") or "CRYPTO")
-        trade_type_cur = STATE.get("position_trade_type") or (self.position_profile.trade_type if self.position_profile else "TREND")
-        trail_activate_roe = float(asset_cfg.get("roe_trail_activate", 1.5))
-        if trade_type_cur == "REVERSAL":
-            trail_activate_roe = min(trail_activate_roe, float(asset_cfg.get("roe_trail_activate", 1.5)) * 0.8)
-        asset_trail_base = float(asset_cfg.get("trail_mult", 3.0))
-        # Tight assets trail closer (smaller ATR multiple); never loosen beyond base.
-        trail_mult = trail_mult * max(0.55, min(1.0, asset_trail_base / 3.0))
-
-        if STATE.get("roe_valid", True) and roe > trail_activate_roe:
-            if not STATE.get("trail_activated", False):
-                STATE["trail_activated"] = True
-                STATE["trail_stop"] = synthetic_sl
-                log_execution(f"[TRAIL] Activated (roe={roe:.2f}% >= {trail_activate_roe:.2f}%, {trade_type_cur}/{STATE.get('position_asset_class')}) with multiplier {trail_mult}", "INFO")
-            if side == "BUY":
-                new_trail = mark_price - trail_mult * atr
-                if new_trail > STATE.get("trail_stop", 0):
-                    STATE["trail_stop"] = new_trail
-            else:
-                new_trail = mark_price + trail_mult * atr
-                if new_trail < STATE.get("trail_stop", float('inf')):
-                    STATE["trail_stop"] = new_trail
-            if (side == "BUY" and mark_price <= STATE.get("trail_stop", 0)) or (side == "SELL" and mark_price >= STATE.get("trail_stop", float('inf'))):
-                log_execution(f"[TRAIL] Stop hit at {mark_price:.4f} (trail={STATE['trail_stop']:.4f})", "WARN")
-                STATE["close_reason"] = "RUNNER_EXIT" if STATE.get("runner_mode", False) or STATE.get("tp1_hit", False) else "TRAILING_STOP"
-                close_position_full()
-                self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
-                DASHBOARD_STATE["live_trade_mode"] = False
+        action = decision.action
+        if action in {"TP1", "TP2", "EXIT", "FORCE_EXIT"}:
+            STATE["close_reason"] = "TP1" if action == "TP1" else ("TP2" if action == "TP2" else decision.reason.upper())
+            ok = self._execute_action(action, reason=STATE["close_reason"], stage=decision.stage, close_price=mark_price)
+            if not ok:
                 return
-        else:
-            pass
-
-        if USE_PPE:
-            state_ppe = {
-                "symbol": symbol,
-                "trail_active": STATE.get("trail_activated", False),
-                "tp1_done": STATE.get("tp1_hit", False),
-                "tp1_hit": STATE.get("tp1_hit", False),
-                "runner_mode": STATE.get("runner_mode", False),
-                "max_price": STATE.get("max_price", entry),
-                "min_price": STATE.get("min_price", entry),
-                "sl": STATE.get("synthetic_sl", 0.0),
-                "trail_stop": STATE.get("trail_stop", 0.0),
-                "remaining_qty": STATE.get("remaining_qty", STATE["qty"]),
-                "smart_trail_mult": trail_mult,
-                "smart_money": smart_money,
-                "momentum_flow": momentum,
-                "profit_lock_activated": STATE.get("profit_lock_activated", False),
-                "trail_tightened": STATE.get("trail_tightened", False)
-            }
-            idx = len(df_live) - 1
-            action, new_sl, new_trail = apply_50_50_profit_engine(
-                df_live, idx, mark_price, atr, side, entry, state_ppe, roe,
-                trade_state=trade_state,
-                continuation_probability=continuation_eval.continuation_probability
-            )
-            if action == "EXIT" and state_ppe.get("smart_money", {}).get("distribution_risk", 0) > 65 and momentum.get("momentum_decay", False):
-                log_execution("[PPE] Institutional exit signal – closing position", "WARN")
-                STATE["close_reason"] = "INSTITUTIONAL_EXIT"
-                close_position_full()
-                self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+            if action == "TP1":
+                STATE["tp1_hit"] = True
+                STATE["tp1_done"] = True
+                STATE["runner_mode"] = True
+                STATE["profit_lock_activated"] = True
+                STATE["be_ratchet_active"] = True
+                STATE["synthetic_sl"] = entry
+                STATE["sl"] = entry
+                STATE["last_confirmed_sl"] = entry
+                STATE["trail_activated"] = False
+                try:
+                    if MODE_LIVE and STATE.get("remaining_qty", 0.0) > 0:
+                        _ensure_native_protection(symbol)
+                except Exception as _tp1_np_exc:
+                    _set_protection_status("UNPROTECTED", reason=f"TP1_REARM_FAILED: {_tp1_np_exc}")
+                try:
+                    atr_val = float(atr)
+                    STATE["trail_stop"] = mark_price - TRAIL_ATR_MULT * atr_val if side == "BUY" else mark_price + TRAIL_ATR_MULT * atr_val
+                except Exception:
+                    pass
+                _trade_event("PROFIT_LOCK", lock_price=entry, reason="TP1_VERIFIED")
+            self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED if action != "TP1" else TradeLifecycleState.PARTIALLY_CLOSED)
+            if action != "TP1":
                 DASHBOARD_STATE["live_trade_mode"] = False
-                return
+            return
 
-        # ---- Phase 2: enforceable dynamic profit/reversal/exhaustion rules ----
-        # Runs after every existing guard so it only ADDS behaviour (dynamic
-        # reversal exit, exhaustion protection, early asset-class profit-taking).
-        try:
-            if self._apply_dynamic_profit_and_exit_rules(
-                symbol=symbol, mark_price=mark_price, atr=atr, side=side, entry=entry,
-                roe=roe, trade_state=trade_state, smart_money=smart_money,
-                momentum=momentum, continuation_eval=continuation_eval,
-                structure_aligned=structure_aligned,
-            ):
-                self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
-                DASHBOARD_STATE["live_trade_mode"] = False
-                return
-        except Exception as _e:
-            log_execution(f"[DYNAMIC] rules error: {_e}", "WARN")
+        if action in {"BREAKEVEN", "MOVE_SL", "TRAIL"} and decision.stop is not None:
+            ok = self._execute_action(action, reason=decision.reason, stage=decision.stage, stop=decision.stop)
+            if ok:
+                STATE["synthetic_sl"] = max(float(STATE.get("synthetic_sl", 0.0) or 0.0), float(decision.stop)) if side == "BUY" else min(float(STATE.get("synthetic_sl", 0.0) or 0.0), float(decision.stop))
+                STATE["sl"] = STATE["synthetic_sl"]
+                STATE["last_confirmed_sl"] = STATE["synthetic_sl"]
+                if action == "BREAKEVEN":
+                    STATE["be_ratchet_active"] = True
+                if action == "TRAIL":
+                    STATE["trail_activated"] = True
+                    STATE["trail_stop"] = float(decision.stop)
 
-        # ---- P1: single TP/SL authority + dashboard refresh (every tick) ----
         _refresh_live_levels(entry, side, atr, symbol, classification=STATE.get("classification"))
         publish_position_state(symbol, side, entry, STATE.get("qty", 0.0), roe)
-
-        if (side == "BUY" and mark_price <= STATE.get("synthetic_sl", 0)) or (side == "SELL" and mark_price >= STATE.get("synthetic_sl", 0)):
-            STATE["close_reason"] = "INTERNAL_SL"
-            close_position_full()
-            self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
-            DASHBOARD_STATE["live_trade_mode"] = False
-            return
 
 _event_bus = EventBus()
 _exchange_sync = ExchangeSyncService(_event_bus)
 _recovery_guard = RecoveryGuard(_event_bus, _exchange_sync)
 _live_manager = LiveTradeManager(_event_bus, _exchange_sync, _recovery_guard)
+
+def _bingx_ws_logger(msg, level="INFO", *args, **kwargs):
+    fn = globals().get("log_execution")
+    if callable(fn):
+        try:
+            fn(msg, level, *args, **kwargs)
+        except Exception:
+            pass
+
+def _on_bingx_ws_event(event):
+    ds = globals().get("DASHBOARD_STATE")
+    if isinstance(ds, dict):
+        ds.setdefault("bingx_ws", {})["last_event"] = time.time()
+    if isinstance(ds, dict):
+        ds.setdefault("bingx_ws", {})["last_event_type"] = (event or {}).get("e") if isinstance(event, dict) else "RAW"
+    try:
+        _exchange_sync._ws_last_event = event
+    except Exception:
+        pass
+
+_BINGX_WS = BingXAccountStream(_on_bingx_ws_event, _bingx_ws_logger) if BingXAccountStream is not None else None
+if _BINGX_WS is not None and MODE_LIVE:
+    try:
+        _ws_thread = _BINGX_WS.start()
+        if _ws_thread is not None:
+            register_runtime_thread(_ws_thread)
+        DASHBOARD_STATE["bingx_ws"] = _BINGX_WS.status()
+    except Exception as _ws_start_exc:
+        DASHBOARD_STATE["bingx_ws"] = {"status": "DEGRADED", "last_error": str(_ws_start_exc)}
 
 def sync_position_state(symbol=None):
     if PAPER_MODE:
@@ -6219,6 +6184,8 @@ def sync_position_state(symbol=None):
             _live_manager.start_trade(symbol, snap.side, snap.entry_price, snap.qty, STATE.get("synthetic_sl", 0.0), STATE.get("dynamic_tp1", 0.0), STATE.get("dynamic_tp2", 0.0), STATE.get("trade_id"))
             _reconcile_levels_after_fill(snap.entry_price, symbol, snap.side, STATE.get("trade_type"),
                                          STATE.get("classification"), None, force_validate=True)
+            if MODE_LIVE:
+                _ensure_native_protection(symbol)
         else:
             _prev_entry = STATE.get("entry", snap.entry_price)
             STATE["entry"] = snap.entry_price
@@ -6744,24 +6711,28 @@ def decision_engine(scenario, rf_signal, adx):
         return "STRONG"
     return "SKIP"
 
+def _route_management_action(action, *, symbol=None, reason="PROFIT_ENGINE", stage=None, close_price=None, stop=None):
+    """Route a management action through the UnifiedTradeManagementBrain.
+
+    The fallback exists only for isolated unit fixtures before _live_manager is
+    constructed; production runtime always has the manager/execution service.
+    """
+    lm = globals().get("_live_manager")
+    if lm is not None and hasattr(lm, "_execute_action"):
+        return bool(lm._execute_action(action, reason=reason, stage=stage, close_price=close_price, stop=stop))
+    log_execution(f"[MANAGEMENT_AUTHORITY] blocked action={str(action).upper()} - manager unavailable", "ERROR")
+    return False
+
 def apply_profit_engine(symbol, current_price, df, idx, position_state):
-    """Canonical profit-taking adapter.
+    """Canonical two-stage profit-taking adapter.
 
-    DEFAULT (SINGLE_TP_ENABLED): TP1 is the ONLY take-profit and closes the
-    FULL remaining position (100%) through the same verified full-close
-    pipeline previously reserved for TP2. TP2 / runner / partial scale-outs are
-    disabled (they are derived OFF from SINGLE_TP_ENABLED). The trigger is the
-    canonical stored target price, never a hard-coded ROE threshold.
-
-    LEGACY (SINGLE_TP_ENABLED=False): TP1 is exactly 50% of the ORIGINAL
-    position; TP2 closes the remaining 50%. LIVE execution is delegated to
-    close_partial() / close_position_full(), which verify exchange fills before
-    state changes.
+    TP1 is always exactly 50% of the ORIGINAL position. TP2 closes the
+    remaining 50%. The trigger is the canonical stored target price, never a
+    hard-coded ROE threshold. LIVE execution is delegated to close_partial()
+    / close_position_full(), which verify exchange fills before state changes.
     """
     if not position_state.get("open"):
         return "HOLD"
-    _single_tp = bool(SINGLE_TP_ENABLED)
-    _tp2_enabled = bool(TP2_ENABLED) and not _single_tp
     side = str(position_state.get("side", "BUY")).upper()
     entry = float(position_state.get("entry", 0.0) or 0.0)
     if entry <= 0:
@@ -6820,11 +6791,11 @@ def apply_profit_engine(symbol, current_price, df, idx, position_state):
     pnl_pct = dirv * (price - entry) / entry * 100.0
 
     if not position_state.get("tp1_hit", False) and valid_tp1:
-        # TP1 = the ONLY take-profit in SINGLE-TP mode: it closes the FULL
-        # remaining position (100%) through the verified full-close pipeline
-        # (the same path TP2 used in legacy 50/50 mode). No runner extension and
-        # no partial scale-out may follow because the position is fully closed.
-        # In LEGACY mode TP1 = 50% of the ORIGINAL position via close_partial().
+        # TP1 = 50% of the ORIGINAL position. close_partial() computes the
+        # quantity from remaining_qty, which equals qty_initial before TP1.
+        # Defensive heal: adopted/restored states can lack remaining_qty (or a
+        # trailing reconcile can momentarily zero it); derive it from the
+        # original size so a genuine TP1 touch is never silently blocked.
         if float(position_state.get("remaining_qty", 0.0) or 0.0) <= 0:
             _heal = float(position_state.get("qty_initial") or position_state.get("qty") or 0.0)
             if _heal <= 0:
@@ -6834,21 +6805,7 @@ def apply_profit_engine(symbol, current_price, df, idx, position_state):
             position_state["mark_price"] = price
         except Exception:
             pass
-        if _single_tp:
-            position_state["close_reason"] = "SINGLE_TP"
-            _tp1_ok = bool(close_position_full(close_price=price, stage="TP1"))
-            if not _tp1_ok:
-                _trade_event("TP1_EXECUTION_FAILED", reason="SINGLE_TP_FULL_CLOSE_NOT_VERIFIED", target=tp1)
-                return "HOLD"
-            position_state["tp1_hit"] = True
-            position_state["tp1_done"] = True
-            position_state["tp2_hit"] = True
-            # Single TP closes 100%: no runner extension, no trailing re-arm.
-            position_state["runner_mode"] = False
-            position_state["trail_activated"] = False
-            log_execution(f"TP1 SINGLE-TP executed at {price:.6f} target={tp1:.6f} | closed remaining 100%", "SUCCESS")
-            return "TP1"
-        _tp1_ok = bool(close_partial(0.5, stage="TP1"))
+        _tp1_ok = _route_management_action("TP1", symbol=symbol, reason="TP1", stage="TP1", close_price=price)
         if not _tp1_ok:
             _trade_event("TP1_EXECUTION_FAILED", reason="PROFIT_ENGINE_PARTIAL_NOT_VERIFIED", target=tp1)
             return "HOLD"
@@ -6867,7 +6824,7 @@ def apply_profit_engine(symbol, current_price, df, idx, position_state):
         try:
             if MODE_LIVE and position_state.get("remaining_qty", 0.0) > 0:
                 _np = _ensure_native_protection(symbol)
-                if str(_np.get("status", "")).upper() not in ("ACTIVE", "PAPER_SYNTHETIC"):
+                if str(_np.get("status", "")).upper() != "PROTECTED":
                     log_execution(f"[TP1] Native protection re-arm status={_np.get('status')}", "WARN")
         except Exception as _np_exc:
             _set_protection_status("UNPROTECTED", reason=f"TP1_REARM_FAILED: {_np_exc}")
@@ -6881,7 +6838,7 @@ def apply_profit_engine(symbol, current_price, df, idx, position_state):
         log_execution(f"TP1 EXECUTED at {price:.6f} target={tp1:.6f} | closed 50%", "SUCCESS")
         return "TP1"
 
-    if _tp2_enabled and position_state.get("tp1_hit", False) and not position_state.get("tp2_hit", False) and valid_tp2:
+    if position_state.get("tp1_hit", False) and not position_state.get("tp2_hit", False) and valid_tp2:
         # TP2 = the entire remaining position (the other 50%). This is a FULL
         # close, not a second 30% partial, so the exchange and accounting end at
         # exactly zero quantity.
@@ -6889,7 +6846,7 @@ def apply_profit_engine(symbol, current_price, df, idx, position_state):
         # by finalize_trade_with_reality() AFTER exchange verification. Intro-
         # duce no second partial-style TP2 message here (Decision 2).
         position_state["close_reason"] = "TP2"
-        _tp2_ok = bool(close_position_full(close_price=price, stage="TP2"))
+        _tp2_ok = _route_management_action("TP2", symbol=symbol, reason="TP2", stage="TP2", close_price=price)
         if not _tp2_ok:
             _trade_event("TP2_EXECUTION_FAILED", reason="FULL_CLOSE_NOT_VERIFIED", target=tp2)
             return "HOLD"
@@ -7380,6 +7337,30 @@ def compute_sl_tp(entry_price, side, classification, atr, df):
         sl = entry_price - atr * 1.6 if side == "BUY" else entry_price + atr * 1.6
         tp1 = entry_price * (1 + 0.008) if side == "BUY" else entry_price * (1 - 0.008)
         tp2 = entry_price * (1 + 0.02) if side == "BUY" else entry_price * (1 - 0.02)
+    # Entry Intelligence v2 can provide a thesis-aware invalidation for any
+    # supported setup, not only REVERSAL. The legacy branch remains the fallback
+    # when no approved structural thesis is available.
+    v2 = STATE.get("entry_intelligence_v2", {}) if isinstance(globals().get("STATE"), dict) else {}
+    if (propose_dynamic_sl is not None and
+            str(v2.get("decision", "")).upper() == "APPROVE" and
+            str(v2.get("side", side)).upper() == str(side).upper()):
+        thesis = v2.get("thesis") or {}
+        event = v2.get("liquidity_event") or {}
+        invalidation = thesis.get("invalidation")
+        if invalidation is not None:
+            try:
+                proposal = propose_dynamic_sl(
+                    side=side, entry=float(entry_price), atr=float(atr),
+                    invalidation=float(invalidation),
+                    liquidity_level=event.get("level"),
+                    liquidity_quality=float(event.get("quality", 0.0) or 0.0),
+                    volatility_multiplier=1.0,
+                )
+                sl = float(proposal["sl"])
+                STATE["entry_dynamic_sl"] = sl
+                STATE["entry_dynamic_sl_basis"] = proposal.get("basis")
+            except Exception:
+                pass
     sl, tp1 = PrecisionSafety.adjust_sl_tp(df.symbol if hasattr(df, 'symbol') else DEFAULT_SYMBOL, entry_price, sl, tp1, side, atr)
     return sl, tp1, tp2
 
@@ -7394,6 +7375,8 @@ STATE = {
     "tp1_price": 0.0, "tp2_price": 0.0, "trade_type": None, "entry_type": None,
     "be_done": False, "be_ratchet_active": False, "classification": None, "location": None, "zone_info": None,
     "position_setup_snapshot": None, "research_decision_packet": None, "research_challenge": None,
+    "entry_intelligence_v2": {}, "entry_dynamic_sl": 0.0,
+    "ema_vwap_management": {}, "reentry_state": None, "reentry_candidate": None,
     "runner_active": False, "scale_ins": 0, "decision_log": [],
     "tp1_hit": False, "tp2_hit": False,
     "zone": {},
@@ -7458,6 +7441,9 @@ STATE = {
     "session_label": None,
     "position_asset_class": "CRYPTO",
     "trade_id": None,
+    "partition_trade_id": None,
+    "partition_snapshot_count": 0,
+    "partition_last_observe_ts": 0.0,
     "protection_status": "UNPROTECTED",
     "native_sl_order_id": None,
     "realized_pnl_usdt": 0.0,
@@ -7479,6 +7465,342 @@ _DATA_FABRIC = DataFabric(evidence_bus=_EVIDENCE_BUS) if DataFabric else None
 if _DATA_FABRIC is not None and EvidenceBusProvider is not None and _EVIDENCE_BUS is not None:
     _DATA_FABRIC.register(EvidenceBusProvider(_EVIDENCE_BUS))
 _TRADE_JOURNAL = TradeLifecycleJournal() if TradeLifecycleJournal else None
+
+
+# ========== PARTITION AI FORENSIC OBSERVABILITY ==========
+def _partition_enabled():
+    return bool(PARTITION_AI_AVAILABLE and GLOBAL_PARTITION_AI is not None and
+                str(os.getenv("PARTITION_AI_ENABLED", "True")).lower() in ("1", "true", "yes", "on"))
+
+
+def _partition_component_score(value, low=0.0, high=100.0, invert=False):
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    if high <= low:
+        return 50.0
+    n = (v - low) / (high - low) * 100.0
+    n = max(0.0, min(100.0, n))
+    return round(100.0 - n if invert else n, 2)
+
+
+def _partition_collect_evidence(symbol=None, side=None, price=None, df=None):
+    """Collect the live evidence already computed by BARON/V29 for forensics only.
+
+    Important: this function calls pure feature calculators only; it never calls
+    TrendStrategyV29.evaluate() and never changes an entry/exit decision.
+    """
+    try:
+        symbol = symbol or STATE.get("current_symbol") or STATE.get("symbol")
+        side = str(side or STATE.get("side") or "BUY").upper()
+        if df is None and symbol:
+            df = get_ohlcv_safe(symbol, 120)
+        if not isinstance(df, pd.DataFrame) or len(df) < 20:
+            df = None
+        if price is None:
+            price = STATE.get("mark_price") or STATE.get("entry") or (float(df["close"].iloc[-1]) if df is not None else 0.0)
+        price = float(price or 0.0)
+        indicators, liquidity, volume, structure, momentum, orderbook = {}, {}, {}, {}, {}, {}
+        if df is not None:
+            try:
+                atr_s, plus_s, minus_s, adx_s = GLOBAL_TREND_STRATEGY_V29._adx_di(df)
+                atr = float(atr_s.iloc[-1]) if pd.notna(atr_s.iloc[-1]) else float(STATE.get("atr") or 0.0)
+                plus = float(plus_s.iloc[-1]) if pd.notna(plus_s.iloc[-1]) else 0.0
+                minus = float(minus_s.iloc[-1]) if pd.notna(minus_s.iloc[-1]) else 0.0
+                adx = float(adx_s.iloc[-1]) if pd.notna(adx_s.iloc[-1]) else 0.0
+                adx_prev = float(adx_s.iloc[-2]) if len(adx_s) >= 2 and pd.notna(adx_s.iloc[-2]) else adx
+                ema20 = float(df["close"].ewm(span=20, adjust=False).mean().iloc[-1])
+                ema50 = float(df["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+                ema200 = float(df["close"].ewm(span=200, adjust=False).mean().iloc[-1])
+                ema9 = float(df["close"].ewm(span=9, adjust=False).mean().iloc[-1])
+                ema21 = float(df["close"].ewm(span=21, adjust=False).mean().iloc[-1])
+                rsi_s = compute_rsi(df, 14)
+                rsi = float(rsi_s.iloc[-1]) if pd.notna(rsi_s.iloc[-1]) else 50.0
+                macd_s = compute_macd(df)
+                macd_hist = float(macd_s.iloc[-1]) if hasattr(macd_s, "iloc") and pd.notna(macd_s.iloc[-1]) else 0.0
+                vw = float(GLOBAL_TREND_STRATEGY_V29._vwap(df))
+                vol_avg = float(df["volume"].iloc[-20:].mean())
+                vol_ratio = float(df["volume"].iloc[-1]) / vol_avg if vol_avg > 0 else 0.0
+                rf_state = STATE.get("rf_signal") or STATE.get("range_filter") or STATE.get("rf") or {}
+                indicators.update({
+                    "adx": round(adx, 4), "adx_slope": round(adx-adx_prev, 4),
+                    "di_plus": round(plus, 4), "di_minus": round(minus, 4),
+                    "di_spread": round(plus-minus, 4), "atr": round(atr, 10),
+                    "atr_pct": round((atr/price*100.0) if price else 0.0, 5),
+                    "ema9": round(ema9, 10), "ema20": round(ema20, 10),
+                    "ema21": round(ema21, 10), "ema50": round(ema50, 10),
+                    "ema200": round(ema200, 10), "rsi": round(rsi, 3),
+                    "macd_hist": round(macd_hist, 6), "vwap": round(vw, 10),
+                    "price_vs_vwap_pct": round((price-vw)/vw*100.0 if vw else 0.0, 5),
+                    "price_vs_ema50_pct": round((price-ema50)/ema50*100.0 if ema50 else 0.0, 5),
+                    "price_vs_ema200_pct": round((price-ema200)/ema200*100.0 if ema200 else 0.0, 5),
+                    "volume_ratio": round(vol_ratio, 4), "rf": rf_state,
+                    "candle_basis": "latest_available_ohlcv",
+                })
+                liq = GLOBAL_TREND_STRATEGY_V29._liquidity_map(df, price)
+                sweep = GLOBAL_TREND_STRATEGY_V29._sweep(df, liq)
+                liquidity = copy.deepcopy(liq)
+                liquidity["sweep"] = {"swept_high": bool(sweep[0]), "swept_low": bool(sweep[1]), "level": sweep[2], "type": sweep[3]}
+                for key in ("target_above", "target_below"):
+                    c = liquidity.get(key)
+                    if isinstance(c, dict) and c.get("level"):
+                        lvl = float(c["level"])
+                        liquidity[f"{key}_distance_pct"] = round(abs(lvl-price)/price*100.0, 5)
+                        liquidity[f"{key}_distance_atr"] = round(abs(lvl-price)/max(atr,1e-12), 3)
+                target = liquidity.get("target_above") if side == "BUY" else liquidity.get("target_below")
+                liquidity["directional_target"] = target
+                liquidity["directional_attraction"] = liquidity.get("target_above_attraction" if side == "BUY" else "target_below_attraction", 0.0)
+                structure = GLOBAL_TREND_STRATEGY_V29._structure(df)
+                volume = GLOBAL_TREND_STRATEGY_V29._volume_flow(df, side)
+                momentum = GLOBAL_TREND_STRATEGY_V29._momentum(df, side)
+                try:
+                    pullback = GLOBAL_TREND_STRATEGY_V29._pullback(df, side, atr, plus, minus, adx)
+                except Exception:
+                    pullback = {}
+                structure["pullback"] = pullback
+                try:
+                    # Forensics must not introduce fresh exchange I/O into the
+                    # trading path. Read only the already-cached order book.
+                    _ob_key = f"{normalize_symbol(symbol)}_10"
+                    _ob_item = globals().get("_ORDERBOOK_CACHE", {}).get(_ob_key, {})
+                    _ob_value = _ob_item.get("value") if isinstance(_ob_item, dict) else None
+                    orderbook = GLOBAL_TREND_STRATEGY_V29._orderbook(_ob_value, side)
+                    if isinstance(orderbook, dict):
+                        orderbook["cache_only"] = True
+                except Exception:
+                    orderbook = {"imbalance": 0.0, "aligned": False, "cache_only": True}
+                indicators["ema_alignment"] = ("BULLISH" if price > ema50 and ema20 > ema50 else "BEARISH" if price < ema50 and ema20 < ema50 else "MIXED")
+                indicators["vwap_alignment"] = ("BULLISH" if price >= vw else "BEARISH")
+                indicators["di_alignment"] = ("BULLISH" if plus > minus else "BEARISH" if minus > plus else "NEUTRAL")
+                indicators["trend_alignment"] = (side == "BUY" and price > ema50 and plus > minus and price >= vw) or (side == "SELL" and price < ema50 and minus > plus and price <= vw)
+            except Exception as exc:
+                indicators.setdefault("collection_error", str(exc)[:180])
+        # Preserve the actual decision-state evidence already carried by BARON.
+        extra_state = {
+            "entry_score": STATE.get("trade_score"),
+            "confidence": STATE.get("current_confidence"),
+            "classification": STATE.get("classification"),
+            "narrative_classification": STATE.get("narrative_classification"),
+            "narrative_confidence": STATE.get("narrative_confidence"),
+            "market_regime": STATE.get("market_regime"),
+            "move_maturity": STATE.get("move_maturity"),
+            "institutional_stage": STATE.get("institutional_stage"),
+            "entry_timing": STATE.get("entry_timing"),
+            "trade_style": STATE.get("trade_style"),
+            "zone_info": STATE.get("zone_info"),
+            "entry_intelligence_v2": STATE.get("entry_intelligence_v2"),
+            "trade_thesis": STATE.get("trade_thesis"),
+            "setup_edge": STATE.get("setup_edge"),
+            "stop_forensics": STATE.get("stop_forensics"),
+            "smart_money": STATE.get("smart_money"),
+            "momentum_flow": STATE.get("momentum_flow"),
+            "trade_state": STATE.get("trade_state"),
+        }
+        smart_money = copy.deepcopy(STATE.get("smart_money") or {})
+        if not smart_money:
+            smart_money = {"institutional_flow": STATE.get("institutional_flow"), "position_vpa": STATE.get("position_vpa") or STATE.get("vpa")}
+        # Measurement-only component scores. They describe evidence strength; they do not gate execution.
+        di_spread = float(indicators.get("di_spread") or STATE.get("prev_di_spread") or 0.0)
+        adx = float(indicators.get("adx") or STATE.get("adx_live") or 0.0)
+        vol_ratio = float(indicators.get("volume_ratio") or 0.0)
+        liq_score = float(liquidity.get("directional_attraction") or 0.0)
+        structure_score = 70.0 if ((side == "BUY" and structure.get("bos_up")) or (side == "SELL" and structure.get("bos_down"))) else 55.0 if structure.get("shift") else 35.0
+        component_scores = {
+            "overall_entry_score": float(STATE.get("trade_score") or 0.0),
+            "adx_strength": _partition_component_score(adx, 18, 45),
+            "di_alignment": _partition_component_score(abs(di_spread), 0, 20),
+            "ema_alignment": 80.0 if indicators.get("trend_alignment") else 45.0,
+            "vwap_alignment": 80.0 if indicators.get("vwap_alignment") == ("BULLISH" if side == "BUY" else "BEARISH") else 35.0,
+            "liquidity": round(liq_score, 2), "volume": _partition_component_score(vol_ratio, 0.6, 2.0),
+            "structure": structure_score,
+            "momentum": 80.0 if momentum.get("aligned") else 40.0,
+            "smart_money": float((smart_money.get("score") or smart_money.get("institutional_score") or 0.0) or 0.0),
+            "orderbook": 70.0 if orderbook.get("aligned") else 40.0,
+            "rf_alignment": 50.0,
+        }
+        news = copy.deepcopy(STATE.get("news") or {})
+        news_reaction = copy.deepcopy(STATE.get("news_reaction") or {})
+        if news_reaction:
+            news["reaction"] = news_reaction
+        # Make NEWS causality auditable without creating a news decision gate.
+        if news:
+            _nbias = str(news.get("bias") or news.get("sentiment") or news.get("direction") or "NEUTRAL").upper()
+            _expected = "BUY" if side == "BUY" else "SELL"
+            _news_dir = "BUY" if _nbias in ("BULLISH", "UP", "POSITIVE") else "SELL" if _nbias in ("BEARISH", "DOWN", "NEGATIVE") else "UNKNOWN"
+            _reaction_dir = str(news_reaction.get("direction") or "UNKNOWN").upper()
+            news["partition_validation"] = {
+                "trade_side": side, "headline_bias": _nbias, "headline_direction": _news_dir,
+                "headline_side_aligned": _news_dir == _expected,
+                "reaction_direction": _reaction_dir,
+                "reaction_side_aligned": _reaction_dir == ("UP" if side == "BUY" else "DOWN"),
+                "causality": news_reaction.get("causality") or news_reaction.get("status"),
+                "event_type": news.get("event_type"), "entity": news.get("entity"),
+                "catalyst": news.get("catalyst"), "source": news.get("source"),
+                "published_ts": news.get("published_ts"),
+                "source_reliability": news.get("source_reliability"),
+            }
+        asset_class = str(STATE.get("position_asset_class") or STATE.get("asset_class") or "UNKNOWN").upper()
+        underlying = None
+        try:
+            scanner = globals().get("GLOBAL_SCANNER") or globals().get("SCANNER")
+            universe = getattr(scanner, "universe", None)
+            classify = getattr(universe, "classify", None)
+            if callable(classify):
+                underlying = classify(symbol)
+        except Exception:
+            pass
+        return {
+            "indicators": indicators, "liquidity": liquidity, "volume": volume,
+            "structure": structure, "momentum": momentum, "smart_money": smart_money,
+            "orderbook": orderbook, "component_scores": component_scores,
+            "news": news, "news_reaction": news_reaction,
+            "state": extra_state,
+            "asset_class": asset_class, "underlying_asset_class": str(underlying or (None if asset_class == "NEWS" else asset_class) or "UNKNOWN").upper(),
+            "price": price,
+        }
+    except Exception as exc:
+        return {"indicators": {}, "liquidity": {}, "volume": {}, "structure": {}, "momentum": {},
+                "smart_money": {}, "orderbook": {}, "component_scores": {}, "news": {},
+                "news_reaction": {}, "state": {"collection_error": str(exc)[:220]},
+                "asset_class": str(STATE.get("position_asset_class") or STATE.get("asset_class") or "UNKNOWN").upper(),
+                "underlying_asset_class": "UNKNOWN", "price": float(price or 0.0)}
+
+
+def _partition_begin_active_trade(df=None):
+    if not _partition_enabled() or not STATE.get("open") or not STATE.get("current_symbol"):
+        return False
+    if STATE.get("partition_trade_id"):
+        return True
+    try:
+        symbol = STATE.get("current_symbol")
+        side = str(STATE.get("side") or "BUY").upper()
+        price = float(STATE.get("entry") or STATE.get("mark_price") or 0.0)
+        evidence = _partition_collect_evidence(symbol, side, price, df)
+        tid = str(STATE.get("trade_id") or "")
+        if not tid:
+            # Existing BARON lifecycle identity must be used; never create a second
+            # independent identity. A deterministic fallback is only for recovered
+            # positions that somehow lack the registry ID.
+            tid = f"TRD-{symbol.replace('/','_').replace(':','_')}-{int(time.time()*1000)}"
+            STATE["trade_id"] = tid
+        rec_tid = GLOBAL_PARTITION_AI.begin_trade(
+            symbol=symbol, side=side, entry_price=price, score=STATE.get("trade_score", 0),
+            reason=STATE.get("entry_reasons") or STATE.get("reason") or "",
+            trade_type=STATE.get("trade_type") or "TECHNICAL", entry_type=STATE.get("entry_type") or "",
+            classification=STATE.get("classification") or STATE.get("narrative_classification") or "",
+            leverage=STATE.get("leverage") or LEVERAGE, margin=STATE.get("margin") or STATE.get("initial_margin") or None,
+            qty=STATE.get("qty_initial") or STATE.get("qty"), sl=STATE.get("sl"), tp1=STATE.get("tp1_price"), tp2=STATE.get("tp2_price"),
+            indicators=evidence["indicators"], liquidity=evidence["liquidity"], volume=evidence["volume"],
+            structure=evidence["structure"], momentum=evidence["momentum"], smart_money=evidence["smart_money"],
+            news=evidence["news"], trade_id=tid, extra={"baron_trade_id": tid, "asset_class": evidence["asset_class"],
+                "underlying_asset_class": evidence["underlying_asset_class"], "component_scores": evidence["component_scores"],
+                "state": evidence["state"], "orderbook": evidence["orderbook"], "mode": "PAPER" if PAPER_MODE else "LIVE"}
+        )
+        # Partition uses the same trade identity where possible. Its own returned
+        # id is only a record key; the BARON trade_id remains authoritative.
+        STATE["partition_trade_id"] = rec_tid
+        STATE["partition_snapshot_count"] = 0
+        STATE["partition_last_observe_ts"] = 0.0
+        DASHBOARD_STATE["partition_ai"] = GLOBAL_PARTITION_AI.status()
+        log_execution(f"[PARTITION_AI] began {rec_tid} for {symbol} {side} class={evidence['asset_class']}", "INFO")
+        return True
+    except Exception as exc:
+        log_execution(f"[PARTITION_AI] begin failed: {exc}", "WARN")
+        return False
+
+
+def _partition_observe_active_trade(df=None, price=None, force=False):
+    if not _partition_enabled() or not STATE.get("open") or not STATE.get("partition_trade_id"):
+        return False
+    try:
+        now = time.time()
+        interval = float(os.getenv("PARTITION_SNAPSHOT_INTERVAL_SEC", "15") or 15.0)
+        if not force and now - float(STATE.get("partition_last_observe_ts") or 0.0) < interval:
+            return False
+        symbol = STATE.get("current_symbol")
+        p = float(price or STATE.get("mark_price") or STATE.get("entry") or get_ticker_safe(symbol) or 0.0)
+        evidence = _partition_collect_evidence(symbol, STATE.get("side"), p, df)
+        GLOBAL_PARTITION_AI.observe(
+            STATE["partition_trade_id"], price=p, roe_pct=STATE.get("roe_pct"),
+            indicators=evidence["indicators"], liquidity=evidence["liquidity"], volume=evidence["volume"],
+            structure=evidence["structure"], momentum=evidence["momentum"], smart_money=evidence["smart_money"],
+            news=evidence["news"], extra={"component_scores": evidence["component_scores"], "orderbook": evidence["orderbook"], "state": evidence["state"], "asset_class": evidence["asset_class"], "underlying_asset_class": evidence["underlying_asset_class"]})
+        STATE["partition_snapshot_count"] = int(STATE.get("partition_snapshot_count") or 0) + 1
+        STATE["partition_last_observe_ts"] = now
+        DASHBOARD_STATE["partition_ai"] = GLOBAL_PARTITION_AI.status()
+        return True
+    except Exception as exc:
+        log_execution(f"[PARTITION_AI] observe failed: {exc}", "WARN")
+        return False
+
+
+def _partition_record_partial(stage, qty, price, pnl_usdt=0.0, pnl_pct=0.0):
+    if not _partition_enabled() or not STATE.get("partition_trade_id"):
+        return False
+    try:
+        margin = float(STATE.get("margin") or STATE.get("initial_margin") or 0.0)
+        roe = (float(pnl_usdt or 0.0) / margin * 100.0) if margin > 0 else float(pnl_pct or 0.0) * float(STATE.get("leverage") or LEVERAGE)
+        GLOBAL_PARTITION_AI.record_partial_close(STATE["partition_trade_id"], stage=str(stage).upper(), qty=qty, price=price, pnl_usdt=pnl_usdt, pnl_pct=pnl_pct, roe_pct=roe)
+        DASHBOARD_STATE["partition_ai"] = GLOBAL_PARTITION_AI.status()
+        return True
+    except Exception as exc:
+        log_execution(f"[PARTITION_AI] partial record failed: {exc}", "WARN")
+        return False
+
+
+def _partition_close_active_trade(symbol, exit_price, pnl_pct, pnl_usdt, exit_reason):
+    if not _partition_enabled() or not STATE.get("partition_trade_id"):
+        return False
+    try:
+        evidence = _partition_collect_evidence(symbol, STATE.get("side"), exit_price)
+        margin = float(STATE.get("margin") or STATE.get("initial_margin") or 0.0)
+        realized_roe = (float(pnl_usdt or 0.0) / margin * 100.0) if margin > 0 else float(pnl_pct or 0.0) * float(STATE.get("leverage") or LEVERAGE)
+        stop_forensic = copy.deepcopy(STATE.get("stop_forensics") or {})
+        pf = copy.deepcopy(STATE.get("partition_forensics") or {})
+        extra = {"baron_trade_id": STATE.get("trade_id"), "asset_class": evidence["asset_class"],
+                 "underlying_asset_class": evidence["underlying_asset_class"], "component_scores": evidence["component_scores"],
+                 "state": evidence["state"], "orderbook": evidence["orderbook"], "stop_forensics": stop_forensic,
+                 "post_sl_reversal": pf.get("post_sl_reversal"), "late_entry": pf.get("late_entry"),
+                 "structure_failure": pf.get("structure_failure"), "momentum_failure": pf.get("momentum_failure"),
+                 "vwap_conflict": pf.get("vwap_conflict"), "ema_conflict": pf.get("ema_conflict"),
+                 "mode": "PAPER" if PAPER_MODE else "LIVE"}
+        GLOBAL_PARTITION_AI.close_trade(
+            STATE["partition_trade_id"], exit_price=float(exit_price or STATE.get("mark_price") or STATE.get("entry") or 0.0),
+            pnl_pct=float(pnl_pct or 0.0), pnl_usdt=float(pnl_usdt or 0.0), exit_reason=str(exit_reason or "UNKNOWN"),
+            actual_roe_pct=realized_roe, indicators=evidence["indicators"], liquidity=evidence["liquidity"],
+            volume=evidence["volume"], structure=evidence["structure"], momentum=evidence["momentum"],
+            smart_money=evidence["smart_money"], news=evidence["news"], extra=extra)
+        STATE["partition_trade_id"] = None
+        STATE["partition_last_observe_ts"] = 0.0
+        DASHBOARD_STATE["partition_ai"] = GLOBAL_PARTITION_AI.status()
+        return True
+    except Exception as exc:
+        log_execution(f"[PARTITION_AI] close record failed: {exc}", "WARN")
+        return False
+
+
+def _partition_post_exit_tick():
+    if not _partition_enabled():
+        return 0
+    try:
+        max_watchers = int(os.getenv("PARTITION_POST_EXIT_MAX_WATCHERS", "12") or 12)
+        symbols = GLOBAL_PARTITION_AI.watched_symbols()[:max_watchers]
+        count = 0
+        for sym in symbols:
+            try:
+                price = get_ticker_safe(sym)
+                if price:
+                    GLOBAL_PARTITION_AI.observe_post_exit(symbol=sym, price=float(price))
+                    count += 1
+            except Exception:
+                continue
+        DASHBOARD_STATE["partition_ai"] = GLOBAL_PARTITION_AI.status()
+        return count
+    except Exception as exc:
+        log_execution(f"[PARTITION_AI] post-exit tick failed: {exc}", "WARN")
+        return 0
+
 
 # Native-protection manager state (fail-closed). _NATIVE_PROTECTION_ERROR keeps
 # the REAL sanitized construction cause instead of silently collapsing init
@@ -7559,6 +7881,7 @@ _SETUP_EDGE = SetupEdgeEngine() if SetupEdgeEngine else None
 
 # ========== DASHBOARD STATE ==========
 DASHBOARD_STATE = {
+    "partition_ai": {},
     "account": {"balance": 0.0, "free_balance": 0.0, "available_margin": 0.0, "mode": "PAPER"},
     "stats": {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0},
     "position": None,
@@ -7571,7 +7894,11 @@ DASHBOARD_STATE = {
     "trade_lifecycle": [],
     "market_intelligence": {},
     "early_moves": [],
-    "news_reaction": {}
+    "news_reaction": {},
+    "execution_state": {"state": "IDLE", "action": None, "order_id": None, "client_order_id": None},
+    "protection": {"status": "UNKNOWN", "order_id": None},
+    "reconciliation": {"state": "UNKNOWN", "order_state": "UNKNOWN", "fill_state": "UNKNOWN", "difference": None},
+    "bingx_ws": {"status": "UNKNOWN"}
 }
 
 def _board_or_empty():
@@ -7668,6 +7995,9 @@ def _build_canonical_position_payload():
         "confidence": STATE.get("current_confidence", None),
         "confidence_level": STATE.get("confidence_level"),
         "regime": STATE.get("market_regime"),
+        "market_regime_legacy": STATE.get("market_regime_legacy"),
+        "market_state": copy.deepcopy(STATE.get("market_state", {})) if isinstance(STATE.get("market_state"), dict) else {},
+        "management_authority": "UnifiedTradeManagementBrain",
         "market_session": STATE.get("market_session"),
         "session_label": STATE.get("session_label"),
         "trade_state": STATE.get("trade_state"),
@@ -7700,7 +8030,18 @@ def _build_canonical_position_payload():
         "early_formation": STATE.get("early_formation", {}),
         "evidence_bus": STATE.get("evidence_bus", {}),
         "setup_edge": STATE.get("setup_edge", {}),
+        "adaptive_entry_assessment": copy.deepcopy(STATE.get("adaptive_entry_assessment", {})),
+        "adaptive_outcome": copy.deepcopy(STATE.get("adaptive_outcome", {})),
         "lifecycle_state": _lifecycle_name(),
+        "asset_class": STATE.get("position_asset_class") or STATE.get("asset_class") or "UNKNOWN",
+        "exchange_symbol": STATE.get("current_symbol"),
+        "position_id": STATE.get("position_id"),
+        "exchange_verification": STATE.get("position_sync_status", "UNKNOWN"),
+        "brain_decision": STATE.get("brain_decision"),
+        "execution_state": DASHBOARD_STATE.get("execution_state", {}),
+        "protection_state": DASHBOARD_STATE.get("protection", {}),
+        "reconciliation_state": DASHBOARD_STATE.get("reconciliation", {}),
+        "bingx_ws": DASHBOARD_STATE.get("bingx_ws", {}),
     }
 
 
@@ -7879,8 +8220,15 @@ class OrderManager:
                 order = self.exchange.create_order(
                     sym, "market", side.lower(), amount,
                     params={"leverage": leverage, "clientOrderId": client_order_id,
-                            "positionSide": _hedge_position_side(side)}
+                            **_order_position_params(side, closing=False)}
                 )
+                try:
+                    STATE["last_order_id"] = (order or {}).get("id") or (order or {}).get("orderId")
+                    STATE["last_client_order_id"] = client_order_id
+                    STATE["last_requested_qty"] = float(amount)
+                    STATE["last_executed_qty"] = float((order or {}).get("filled") or 0.0)
+                except Exception:
+                    pass
                 self._pending_orders[client_order_id] = {
                     "symbol": sym,
                     "order": order,
@@ -8197,7 +8545,7 @@ def close_position(amount, symbol):
     close_side = "sell" if side == "BUY" else "buy"
     try:
         amount = float(ex.amount_to_precision(sym, amount))
-        order = safe_api_call(ex.create_order, sym, "market", close_side, amount, params={"positionSide": _hedge_position_side(side)})
+        order = safe_api_call(ex.create_order, sym, "market", close_side, amount, params=_order_position_params(side, closing=True))
         with _TRADE_LOCK:
             _ACTIVE_TRADE = False
         log_execution(f"[CLOSE] Closed {amount} {symbol}", "SUCCESS")
@@ -8347,8 +8695,35 @@ def finalize_trade_with_reality(symbol):
     _close_side = STATE.get("side")
     _close_tid = STATE.get("trade_id")
     _close_entry_time = STATE.get("entry_time") or STATE.get("last_update_ts") or time.time()
+    # Partition closes before STATE is reset so the final forensic fingerprint
+    # contains the authoritative realized result, peak/MAE state and exit reason.
+    _partition_close_active_trade(
+        symbol,
+        STATE.get("close_execution_price") or STATE.get("mark_price") or mark_price or STATE.get("entry"),
+        pnl_pct, pnl_usdt, _close_reason,
+    )
+    # Stop forensics must be captured before the closed-trade ledger append.
+    # INTERNAL_SL can finalize PAPER state before the later re-entry analysis
+    # runs; initializing here prevents an UnboundLocalError from rolling back
+    # the close bookkeeping after PnL has already been credited.
+    _stop_forensic = copy.deepcopy(STATE.get("stop_forensics"))
     _outcome_saved = _capture_trade_outcome_memory(symbol, result, pnl_usdt, pnl_pct, _close_reason)
-    PERF.setdefault("closed_trades", []).append({"trade_id": _close_tid, "symbol": symbol, "side": _close_side, "result": result, "pnl_pct": pnl_pct, "pnl_usdt": pnl_usdt, "closed_at": time.time(), "peak_roe": STATE.get("peak_roe", 0.0), "management_action": STATE.get("management_action"), "trade_style": STATE.get("trade_style"), "exit_reason": _close_reason, "outcome_memory_saved": _outcome_saved})
+    _adaptive_saved = None
+    if GLOBAL_ADAPTIVE_TRADE_INTELLIGENCE is not None:
+        try:
+            _adaptive_saved = GLOBAL_ADAPTIVE_TRADE_INTELLIGENCE.record_outcome(
+                STATE, pnl_usdt, pnl_pct, result,
+                peak_roe=STATE.get("peak_roe", 0.0),
+                drawdown_from_peak=STATE.get("drawdown_from_peak", 0.0),
+                exit_reason=_close_reason)
+            STATE["adaptive_outcome"] = _adaptive_saved
+            log_execution(
+                f"[AI_TRADE_MEMORY] {symbol} {STATE.get('side')} -> "
+                f"{_adaptive_saved.get('label', 'UNKNOWN')} saved={_adaptive_saved.get('saved', False)}",
+                "SUCCESS" if _adaptive_saved.get("saved") else "WARN")
+        except Exception as _ati_close_exc:
+            log_execution(f"[AI_TRADE_MEMORY] outcome record failed: {_ati_close_exc}", "WARN")
+    PERF.setdefault("closed_trades", []).append({"trade_id": _close_tid, "symbol": symbol, "side": _close_side, "result": result, "pnl_pct": pnl_pct, "pnl_usdt": pnl_usdt, "closed_at": time.time(), "peak_roe": STATE.get("peak_roe", 0.0), "management_action": STATE.get("management_action"), "trade_style": STATE.get("trade_style"), "exit_reason": _close_reason, "stop_classification": (_stop_forensic or {}).get("classification") if isinstance(_stop_forensic, dict) else None, "outcome_memory_saved": _outcome_saved, "adaptive_label": (_adaptive_saved or {}).get("label") if isinstance(_adaptive_saved, dict) else None})
     PERF["last_trade"] = {"trade_id": STATE.get("trade_id"), "symbol": symbol, "result": result, "pnl_pct": pnl_pct, "pnl_usdt": pnl_usdt}
     TRADE_STATE.update({
         "in_position": False,
@@ -8374,6 +8749,16 @@ def finalize_trade_with_reality(symbol):
         _dfx = get_ohlcv_safe(symbol, 50)
     except Exception:
         _dfx = None
+    if _dfx is not None and len(_dfx) >= 20:
+        try:
+            _candidate = _prepare_stop_hunt_reentry_candidate(symbol, _dfx)
+            if _candidate:
+                MEMORY[f"stop_hunt_rearm_{symbol}"] = _candidate
+                STATE["reentry_candidate"] = copy.deepcopy(_candidate)
+                STATE["reentry_state"] = "STOP_HUNT_REARM"
+            _stop_forensic = copy.deepcopy(STATE.get("stop_forensics"))
+        except Exception as _rearm_exc:
+            log_execution(f"[STOP_FORENSICS] preparation failed: {_rearm_exc}", "WARN")
     _liq = "UNKNOWN"
     if _dfx is not None and len(_dfx) > 10:
         try:
@@ -8449,6 +8834,13 @@ def finalize_trade_with_reality(symbol):
         STATE["close_execution_price"] = None
         STATE["qty_initial"] = 0.0
         STATE["dynamic_reversal_exit_done"] = False
+        STATE["entry_intelligence_v2"] = {}
+        STATE["entry_dynamic_sl"] = 0.0
+        STATE["entry_dynamic_sl_basis"] = None
+        STATE["ema_vwap_management"] = {}
+        STATE["stop_forensics"] = None
+        STATE["reentry_state"] = None
+        STATE["reentry_candidate"] = None
         STATE["dynamic_exhaustion_protect_done"] = False
         STATE["dynamic_partial_done"] = False
         STATE["last_confirmed_sl"] = 0.0
@@ -8787,6 +9179,139 @@ def evaluate_with_narrative(symbol, side, price, atr_val, df, ob, rf_signal, exi
     STATE["confidence_level"] = final_conf
     return True, final_class, narrative
 
+def _institutional_entry_v2_assessment(symbol, side, df, price, atr, zone, structure_ok, displacement_ok, rejection_ok):
+    """Build the pure Entry Intelligence v2 assessment without exchange actions."""
+    if GLOBAL_INSTITUTIONAL_ENTRY_ENGINE is None:
+        return {"decision": "UNAVAILABLE", "reasons": ["ENTRY_INTEL_V2_UNAVAILABLE"]}
+    z = dict(zone or {})
+    if not z.get("price"):
+        zp = z.get("level") or z.get("midpoint")
+        if zp:
+            z["price"] = zp
+    if z.get("quality") is None:
+        if z.get("score") is not None:
+            z["quality"] = float(z.get("score") or 0.0) / 100.0
+        elif z.get("strength") is not None:
+            z["quality"] = min(float(z.get("strength") or 0.0) / 10.0, 1.0)
+    try:
+        return GLOBAL_INSTITUTIONAL_ENTRY_ENGINE.assess(
+            df=df, side=side, price=float(price), atr=float(atr or 0.0), zone=z,
+            structure_ok=bool(structure_ok), displacement_ok=bool(displacement_ok),
+            rejection_ok=bool(rejection_ok),
+        )
+    except Exception as exc:
+        return {"decision": "UNAVAILABLE", "reasons": [f"ENTRY_INTEL_V2_ERROR:{type(exc).__name__}"], "error": str(exc)}
+
+
+def _prepare_stop_hunt_reentry_candidate(symbol, df):
+    """Classify a pre-TP1 internal stop and preserve one re-entry candidate.
+
+    This helper is deliberately decision/state only: it never places or closes
+    an order. Re-entry requires the same thesis identity plus a fresh sweep and
+    reclaim; normal new setups are unaffected when no candidate exists.
+    """
+    if classify_stop_event is None:
+        return None
+    if str(STATE.get("close_reason", "")).upper() != "INTERNAL_SL":
+        return None
+    if STATE.get("tp1_hit", False):
+        return None
+    v2 = STATE.get("entry_intelligence_v2") or {}
+    side = str(STATE.get("side") or "BUY").upper()
+    entry = float(STATE.get("entry", 0.0) or 0.0)
+    stop_price = float(STATE.get("synthetic_sl", 0.0) or STATE.get("sl", 0.0) or 0.0)
+    current_price = float(STATE.get("mark_price", entry) or entry)
+    atr = max(float(STATE.get("atr", 0.0) or STATE.get("entry_atr", 0.0) or 0.0), 1e-9)
+    thesis = v2.get("thesis") or {}
+    invalidation = float(thesis.get("invalidation", stop_price) or stop_price)
+    manager_ctx = STATE.get("ema_vwap_management") or {}
+    ema200_intact = bool(manager_ctx.get("ema200_intact", True))
+    structure_failed = bool(manager_ctx.get("structure_failure", False)) or float(STATE.get("thesis_failure_score", 0.0) or 0.0) >= 50.0
+    fresh_sweep = False
+    reclaim = False
+    liquidity = {}
+    try:
+        liquidity = GLOBAL_INSTITUTIONAL_ENTRY_ENGINE.detect_liquidity_event(df, side, atr) if GLOBAL_INSTITUTIONAL_ENTRY_ENGINE is not None else {}
+        fresh_sweep = bool(liquidity.get("detected", False))
+        reclaim = bool(liquidity.get("reclaimed", False))
+    except Exception:
+        pass
+    entry_window = str(v2.get("entry_window", "UNKNOWN")).upper()
+    volatility_spike = bool(atr > max(float(STATE.get("entry_atr", atr) or atr), 1e-9) * 1.75)
+    forensic = classify_stop_event(
+        side=side, entry=entry, stop_price=stop_price, current_price=current_price,
+        invalidation=invalidation, ema200_intact=ema200_intact,
+        structure_failed=structure_failed, fresh_sweep=fresh_sweep,
+        reclaim=reclaim, volatility_spike=volatility_spike,
+        entry_window=entry_window,
+    )
+    STATE["stop_forensics"] = copy.deepcopy(forensic)
+    if forensic.get("classification") != "STOP_HUNT":
+        return None
+    fp = str(thesis.get("fingerprint") or "")
+    if not fp and make_thesis_fingerprint is not None:
+        fp = make_thesis_fingerprint({
+            "side": side, "setup_type": v2.get("setup_type"),
+            "origin": thesis.get("origin"),
+            "liquidity_level": liquidity.get("level"),
+            "zone_price": (STATE.get("zone_info") or {}).get("price") if isinstance(STATE.get("zone_info"), dict) else None,
+        })
+    if not fp:
+        return None
+    return {
+        "symbol": symbol, "side": side, "classification": "STOP_HUNT",
+        "thesis_fingerprint": fp, "reentries_used": 0,
+        "created_at": time.time(), "expires_at": time.time() + 30 * 60,
+        "entry_type": v2.get("setup_type", "LIQUIDITY_REVERSAL"),
+        "liquidity_event": copy.deepcopy(liquidity),
+        "forensics": copy.deepcopy(forensic),
+    }
+
+
+def _maybe_arm_stop_hunt_reentry(symbol, side, assessment):
+    if evaluate_reentry is None or not isinstance(assessment, dict):
+        return None
+    key = f"stop_hunt_rearm_{symbol}"
+    candidate = MEMORY.get(key)
+    if not isinstance(candidate, dict):
+        return None
+    if time.time() > float(candidate.get("expires_at", 0.0) or 0.0):
+        MEMORY.pop(key, None)
+        return None
+    if str(candidate.get("side", "")).upper() != str(side).upper():
+        return None
+    result = evaluate_reentry(
+        stop_classification=candidate.get("classification", "UNKNOWN"),
+        assessment=assessment,
+        reentries_used=int(candidate.get("reentries_used", 0) or 0),
+        thesis_fingerprint=str(candidate.get("thesis_fingerprint", "")),
+    )
+    if result.get("allowed"):
+        STATE["reentry_state"] = result.get("state")
+        STATE["reentry_candidate"] = copy.deepcopy(candidate)
+        return result
+    if result.get("state") == "INVALIDATED":
+        MEMORY.pop(key, None)
+        STATE["reentry_state"] = "INVALIDATED"
+        STATE["reentry_candidate"] = None
+    else:
+        STATE["reentry_state"] = result.get("state", "STOP_HUNT_REARM")
+    return result
+
+
+def _consume_stop_hunt_reentry(symbol):
+    if str(STATE.get("reentry_state", "")).upper() != "REENTRY_READY":
+        return
+    key = f"stop_hunt_rearm_{symbol}"
+    candidate = MEMORY.get(key)
+    if isinstance(candidate, dict):
+        candidate["reentries_used"] = int(candidate.get("reentries_used", 0) or 0) + 1
+        candidate["consumed_at"] = time.time()
+    MEMORY.pop(key, None)
+    STATE["reentry_state"] = "CONSUMED"
+    STATE["reentry_candidate"] = None
+
+
 def check_institutional_entry(symbol, side, df, ob, atr, price):
     """Institutional entry gate with a canonical evidence fallback.
 
@@ -8812,9 +9337,9 @@ def check_institutional_entry(symbol, side, df, ob, atr, price):
             _maturity = classify_move_maturity(df.iloc[:-1] if len(df) > 40 else df, float(compute_atr(df).iloc[-1]))
             STATE["move_maturity"] = _maturity
             if _maturity in ("LATE_EXPANSION", "EXHAUSTION"):
-                _record_exec_blocker(symbol, "ENTRY_QUALITY_REJECT", f"move maturity={_maturity}", side, score)
+                _record_exec_blocker(symbol, "ENTRY_QUALITY_REJECT", f"move maturity={_maturity}", side, 0)
                 log_execution(f"[ENTRY] {symbol} rejected: {_maturity} move is too mature", "WARN")
-                return False
+                return False, None, f"Move maturity {_maturity} is too mature"
         except Exception as _mat_err:
             log_execution(f"[MATURITY] {symbol} validation unavailable: {_mat_err}", "WARN")
     reasons = []
@@ -8949,11 +9474,82 @@ def check_institutional_entry(symbol, side, df, ob, atr, price):
     if rejection:
         reasons.append("REJECTION")
 
+    # Institutional Entry Intelligence v2 becomes the entry-timing authority
+    # once the canonical structural prerequisites are present. It never places
+    # orders; it only approves/blocks the setup using EMA50/EMA200, VWAP,
+    # liquidity-event quality, causal-zone proximity and anti-chase geometry.
+    v2_df = df
+    if GLOBAL_INSTITUTIONAL_ENTRY_ENGINE is not None and len(df) < 220:
+        try:
+            deep = get_ohlcv_safe(symbol, INSTITUTIONAL_OHLCV_DEPTH)
+            if deep is not None and is_valid_dataframe(deep) and len(deep) >= 200:
+                v2_df = deep
+        except Exception:
+            pass
+    v2_zone = dict(zone or {})
+    if fallback_zone_price and not v2_zone.get("price"):
+        v2_zone["price"] = fallback_zone_price
+    if zone_valid and not v2_zone.get("quality"):
+        if v2_zone.get("score") is not None:
+            v2_zone["quality"] = min(float(v2_zone.get("score") or 0.0) / 100.0, 1.0)
+        elif v2_zone.get("strength") is not None:
+            v2_zone["quality"] = min(float(v2_zone.get("strength") or 0.0) / 10.0, 1.0)
+        else:
+            v2_zone["quality"] = 0.70 if zone_valid else 0.0
+    v2 = _institutional_entry_v2_assessment(
+        symbol, side, v2_df, price, atr, v2_zone, structure, disp, rejection
+    )
+    STATE["entry_intelligence_v2"] = copy.deepcopy(v2)
+    market_state = copy.deepcopy(v2.get("market_state") or {})
+    if market_state:
+        MEMORY[f"market_state_{symbol}"] = market_state
+        MEMORY["market_state"] = market_state
+    if os.getenv("INSTITUTIONAL_ENTRY_V2_HARD_GATE", "1").strip().lower() in {"1", "true", "yes", "on"}:
+        if str(v2.get("decision", "UNAVAILABLE")).upper() != "APPROVE":
+            v2_reason = "; ".join(v2.get("reasons", [])[:4]) or str(v2.get("decision", "UNAVAILABLE"))
+            _record_exec_blocker(symbol, "ENTRY_INTELLIGENCE_V2", v2_reason, side, 0)
+            return False, None, f"Institutional Entry v2 {v2.get('decision', 'UNAVAILABLE')}: {v2_reason}"
+        reasons.extend([r for r in v2.get("reasons", []) if r not in reasons])
+        reasons.append(f"ENTRY_WINDOW_{v2.get('entry_window', 'UNKNOWN')}")
+        reasons.append(f"SETUP_{v2.get('setup_type', 'UNDEFINED')}")
+        _reentry_eval = _maybe_arm_stop_hunt_reentry(symbol, side, v2)
+        if isinstance(_reentry_eval, dict) and _reentry_eval.get("allowed"):
+            reasons.append("STOP_HUNT_REENTRY")
+
+    # Enforce the same early-transition contract at the canonical institutional
+    # gate after v2 has had a chance to obtain the required deep EMA200 history.
+    if str(os.getenv("EARLY_TREND_ENTRY_HARD_GATE", "1")).strip().lower() in {"1", "true", "yes", "on"}:
+        _timing_ok, _timing_info = _technical_entry_timing_gate(
+            symbol, side, v2_df, float(price), float(atr or 0.0), entry_type="TECHNICAL")
+        STATE["entry_timing_guard"] = _timing_info
+        if not _timing_ok:
+            return False, None, (
+                f"Early-transition timing required: phase={_timing_info.get('phase', 'UNKNOWN')} "
+                f"cross_age={_timing_info.get('cross_age')} "
+                f"distance_EMA50={_timing_info.get('distance_ema50_atr', 0):.2f}ATR"
+            )
+
     adx_series = compute_adx(df)
     adx_now = float(adx_series.iloc[-1]) if adx_series is not None and len(adx_series) else 0.0
-    if adx_now < float(cfg["min_adx"]) or adx_now > float(cfg["max_adx"]):
-        return False, None, f"ADX {adx_now:.1f} outside [{cfg['min_adx']},{cfg['max_adx']}]"
-    reasons.append(f"ADX={adx_now:.1f}")
+    v2_approved = str((STATE.get("entry_intelligence_v2") or {}).get("decision", "")).upper() == "APPROVE"
+    v2_window = str((STATE.get("entry_intelligence_v2") or {}).get("entry_window", "UNKNOWN")).upper()
+    v2_setup = str((STATE.get("entry_intelligence_v2") or {}).get("setup_type", "UNDEFINED")).upper()
+    adx_floor = float(cfg["min_adx"])
+    if adx_now < adx_floor:
+        transition_supported = v2_approved and v2_setup in {"LIQUIDITY_REVERSAL", "EARLY_EXPANSION"} and (
+            str(((STATE.get("entry_intelligence_v2") or {}).get("direction") or {}).get("ema_cross", "NONE")).upper() != "NONE"
+            or bool(((STATE.get("entry_intelligence_v2") or {}).get("vwap") or {}).get("reclaim"))
+            or float(((STATE.get("entry_intelligence_v2") or {}).get("liquidity_event") or {}).get("quality", 0.0) or 0.0) >= 0.80
+        )
+        if not (transition_supported and adx_now >= max(12.0, adx_floor - 4.0)):
+            return False, None, f"ADX {adx_now:.1f} below dynamic floor {adx_floor:.1f}"
+        reasons.append(f"ADX_EARLY={adx_now:.1f}")
+    elif adx_now > float(cfg["max_adx"]):
+        if not (v2_approved and v2_window in {"EARLY", "CONFIRMED"}):
+            return False, None, f"ADX {adx_now:.1f} too high for late entry"
+        reasons.append(f"ADX_EXPANSION={adx_now:.1f}")
+    else:
+        reasons.append(f"ADX={adx_now:.1f}")
 
     vol_state = classify_volume(df)
     reasons.append(
@@ -9003,8 +9599,148 @@ def check_institutional_entry(symbol, side, df, ob, atr, price):
 
     return True, "INSTITUTIONAL_SNIPER", " | ".join(dict.fromkeys(reasons))
 
+def _technical_entry_timing_gate(symbol, side, df, price, atr, entry_type=""):
+    """Fail-closed timing gate for automated technical entries.
+
+    BARON is intentionally an *early-transition* system: the EMA50/EMA200
+    relationship is context, while liquidity/structure/displacement remains the
+    actual trigger. A technical entry is therefore allowed only before the
+    crossing is mature or within the first few closed candles after the cross.
+    News and manual entries are outside this technical timing contract.
+    """
+    side_u = str(side or "").upper()
+    et = str(entry_type or "").upper()
+    if et in {"MANUAL", "NEWS", "NEWS_TRADING"} or side_u not in {"BUY", "SELL"}:
+        return True, {"phase": "EXEMPT", "reason": "NON_TECHNICAL_ENTRY"}
+    if os.getenv("EARLY_TREND_ENTRY_HARD_GATE", "1").strip().lower() not in {"1", "true", "yes", "on"}:
+        return True, {"phase": "DISABLED", "reason": "GATE_DISABLED"}
+    try:
+        ms = GLOBAL_MARKET_REGIME_ENGINE.analyze(df).to_dict() if GLOBAL_MARKET_REGIME_ENGINE is not None else {}
+        ema = ms.get("ema", {}) or {}
+        phase = str(ema.get("crossing_phase", "UNKNOWN")).upper()
+        allowed_phase = {
+            "BUY": {"PRE_CROSS_BULLISH", "POST_CROSS_EARLY"},
+            "SELL": {"PRE_CROSS_BEARISH", "POST_CROSS_EARLY"},
+        }[side_u]
+        e50 = float(ema.get("ema50") or 0.0)
+        px = float(price or 0.0)
+        atr_v = max(float(atr or 0.0), 1e-12)
+        distance_ema50_atr = abs(px - e50) / atr_v if e50 > 0 else 999.0
+        early_ok = phase in allowed_phase and distance_ema50_atr <= float(os.getenv("EARLY_ENTRY_MAX_EMA50_ATR", "1.75"))
+        info = {
+            "phase": phase,
+            "cross_state": ema.get("cross_state", "NONE"),
+            "cross_age": ema.get("cross_age"),
+            "distance_ema50_atr": round(distance_ema50_atr, 3),
+            "max_distance_ema50_atr": float(os.getenv("EARLY_ENTRY_MAX_EMA50_ATR", "1.75")),
+            "market_state": ms.get("state", "UNKNOWN"),
+        }
+        if not early_ok:
+            _record_exec_blocker(symbol, "ENTRY_TIMING_REJECT",
+                                 f"early transition required; phase={phase} cross_age={ema.get('cross_age')} "
+                                 f"distance_ema50_atr={distance_ema50_atr:.2f}", side, 0)
+            log_execution(
+                f"[ENTRY_TIMING] {symbol} {side_u} rejected: phase={phase} "
+                f"cross_age={ema.get('cross_age')} distance_from_EMA50={distance_ema50_atr:.2f}ATR",
+                "WARN", debounce_key=f"entry_timing_{symbol}_{side_u}", debounce_sec=15)
+            return False, info
+        log_execution(
+            f"[ENTRY_TIMING] {symbol} {side_u} EARLY {phase} cross_age={ema.get('cross_age')} "
+            f"distance_EMA50={distance_ema50_atr:.2f}ATR",
+            "INFO", debounce_key=f"entry_timing_{symbol}_{side_u}", debounce_sec=15)
+        return True, info
+    except Exception as exc:
+        log_execution(f"[ENTRY_TIMING] {symbol} validation error: {exc}", "ERROR")
+        _record_exec_blocker(symbol, "ENTRY_TIMING_REJECT", f"validation error: {type(exc).__name__}", side, 0)
+        return False, {"phase": "UNKNOWN", "reason": "VALIDATION_ERROR"}
+
 # ========== SMART OPPORTUNITY SELECTION (REPLACED) ==========
+
 def smart_opportunity_selection():
+    """BARON TREND v29 technical-entry authority.
+
+    Scanner/Radar/Institutional Queue are evidence/discovery providers. This
+    function is the only automated technical selector used by the main loop.
+    News/manual paths remain separate. No order is submitted here until the
+    unified execute_entry() boundary.
+    """
+    strategy = globals().get("GLOBAL_TREND_STRATEGY_V29")
+    if strategy is None:
+        log_execution("[TREND_V29] strategy unavailable; technical entry fail-closed", "ERROR")
+        return False
+
+    candidates = []
+    for c in MEMORY.get("scanner_v2_buy", [])[:8]:
+        candidates.append({"symbol": c.get("symbol"), "side": "BUY", "score": c.get("score", 0), "source": "v2"})
+    for c in MEMORY.get("scanner_v2_sell", [])[:8]:
+        candidates.append({"symbol": c.get("symbol"), "side": "SELL", "score": c.get("score", 0), "source": "v2"})
+    for c in MEMORY.get("rf_watchlist", [])[:15]:
+        if c.get("rf_signal") in ("BUY", "SELL"):
+            candidates.append({"symbol": c.get("symbol"), "side": c.get("rf_signal"), "score": c.get("score", 0), "source": "rf"})
+    # Institutional radar is a discovery source only. Direction is revalidated
+    # from the current completed candle by TREND v29.
+    for c in MEMORY.get("radar_top5", [])[:8]:
+        side = str(c.get("side") or c.get("signal") or "").upper()
+        if side in ("BUY", "SELL"):
+            candidates.append({"symbol": c.get("symbol"), "side": side, "score": c.get("score", 0), "source": "radar"})
+
+    seen = {}
+    for c in candidates:
+        sym = c.get("symbol")
+        if not sym:
+            continue
+        if sym not in seen or float(c.get("score", 0) or 0) > float(seen[sym].get("score", 0) or 0):
+            seen[sym] = c
+    candidates = list(seen.values())
+
+    evaluated = []
+    for cand in candidates[:25]:
+        try:
+            sym, side = cand["symbol"], cand["side"]
+            df = get_ohlcv_safe(sym, 120)
+            if df is None or not validate_dataframe(df, 80):
+                continue
+            try:
+                df.symbol = sym
+            except Exception:
+                pass
+            ob = get_orderbook_cached(sym, limit=10)
+            rf = RFEngine(20, 3.5).compute(df)
+            decision = strategy.evaluate(sym, side, df, ob, rf)
+            MEMORY[f"trend_v29_{sym}"] = decision.to_dict()
+            evaluated.append(decision)
+        except Exception as exc:
+            log_execution(f"[TREND_V29] evaluation failed for {cand.get('symbol')}: {exc}", "WARN")
+
+    approved = [d for d in evaluated if d.approved]
+    if not approved:
+        return False
+    best = max(approved, key=lambda d: d.score)
+    price = float(best.metrics["price"])
+    context = dict(best.context or {})
+    win_sym = str(best.metrics.get("symbol") or DEFAULT_SYMBOL)
+    context.update({
+        "asset_class": AssetBehaviorProfile.resolve_asset_class(win_sym),
+        "strategy_authority": "BARON_TREND_V29",
+        "entry_intelligence_v2": {
+            "decision": "APPROVE",
+            "side": best.side,
+            "thesis": {"invalidation": best.sl, "side": best.side},
+            "liquidity_event": {"level": best.metrics.get("sweep_level"), "quality": best.metrics.get("target_attraction", 0.0)},
+        },
+    })
+    reason = f"BARON_TREND_V29 score={best.score:.1f} | " + " | ".join(best.reasons[:12])
+    ok = execute_entry(
+        best.side, win_sym, price, best.sl, best.tp1, best.tp2, best.score, reason,
+        float(best.metrics["atr"]), "TREND", "LIQUIDITY_PULLBACK_CONTINUATION",
+        "EARLY_TREND", context=context,
+    )
+    if ok:
+        log_execution(f"[TREND_V29] ENTERED {win_sym} {best.side} score={best.score:.1f} pullback={best.metrics['pullback']['state']}", "SUCCESS")
+        return True
+    return False
+
+def legacy_smart_opportunity_selection():
     """Select the best opportunity using the new strategy."""
     candidates = []
     for c in MEMORY.get("scanner_v2_buy", [])[:5]:
@@ -9386,9 +10122,43 @@ def _build_entry_setup_snapshot(symbol, side, df, price, atr, context=None):
         liquidity = detect_liquidity_context(df, lookback=10) if isinstance(df, pd.DataFrame) else "UNKNOWN"
     except Exception:
         liquidity = "UNKNOWN"
+    # Immutable entry-time feature snapshot for BARON Adaptive Trade Intelligence.
+    # These values are captured from the entry frame only; no future candles are
+    # ever allowed into the learning record.
+    indicators = {}
+    if isinstance(df, pd.DataFrame) and len(df) >= 30:
+        try:
+            _atr_series = compute_atr(df, 14)
+            _adx_series, _dip_series, _dim_series = compute_adx(df, 14, return_di=True)
+            _rsi_series = compute_rsi(df, 14)
+            _macd_line, _macd_signal, _macd_hist = compute_macd(df)
+            _vwap = vwap_features(df)
+            _ema50 = float(ema(df["close"], 50).iloc[-1])
+            _ema200 = float(ema(df["close"], min(200, max(50, len(df)))).iloc[-1])
+            indicators = {
+                "atr": float(_atr_series.iloc[-1]),
+                "adx": float(_adx_series.iloc[-1]),
+                "di_plus": float(_dip_series.iloc[-1]),
+                "di_minus": float(_dim_series.iloc[-1]),
+                "rsi": float(_rsi_series.iloc[-1]),
+                "macd_hist": float(_macd_hist.iloc[-1]),
+                "vwap": float(_vwap.get("vwap", 0.0)),
+                "vwap_distance": float(_vwap.get("distance", 0.0)),
+                "vwap_slope": float(_vwap.get("slope", 0.0)),
+                "ema50": _ema50,
+                "ema200": _ema200,
+                "ema50_above_200": bool(_ema50 > _ema200),
+            }
+        except Exception:
+            indicators = {}
     return {
         "symbol": str(symbol), "side": str(side).upper(), "captured_at": time.time(),
         "entry_price": float(price), "entry_atr": float(atr or 0.0),
+        "indicators": indicators,
+        "adx": indicators.get("adx", 0.0),
+        "rsi": indicators.get("rsi", 50.0),
+        "vwap_distance": indicators.get("vwap_distance", 0.0),
+        "ema50_above_200": indicators.get("ema50_above_200", False),
         "zone": z, "zone_low": zl, "zone_high": zh,
         "zone_type": (z or {}).get("type") or (z or {}).get("zone_type") or ("ORDER_BLOCK" if zl and zh else "UNKNOWN"),
         "zone_strength": float((z or {}).get("strength", context.get("zone_strength", 0.0)) or 0.0),
@@ -9397,6 +10167,8 @@ def _build_entry_setup_snapshot(symbol, side, df, price, atr, context=None):
         "ob_grade": ob_grade, "structure_shift": structure,
         "liquidity_event": liquidity,
         "vpa": copy.deepcopy(context.get("vpa", {})) if isinstance(context.get("vpa"), dict) else {},
+        "institutional_evidence": copy.deepcopy(context.get("institutional_evidence", {})) if isinstance(context.get("institutional_evidence"), dict) else {},
+        "forecast_evidence": copy.deepcopy(context.get("forecast_evidence", {})) if isinstance(context.get("forecast_evidence"), dict) else {},
         "hunter": copy.deepcopy(context.get("pro_hunter", {})) if isinstance(context.get("pro_hunter"), dict) else {},
     }
 
@@ -9426,14 +10198,52 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     is institutionally mature; this function remains the sole order-entry
     authority and preserves the exchange/portfolio safety boundary."""
     context = context if isinstance(context, dict) else {}
+    _entry_intel_snapshot = copy.deepcopy(context.get("entry_intelligence_v2") or STATE.get("entry_intelligence_v2") or {})
+    # Hard portfolio authority: no direct fast-path can bypass 6 total / 5
+    # technical / 1 news. PortfolioManager remains the normal open authority;
+    # this guard protects direct/manual/legacy execute_entry callers too.
+    try:
+        _portfolio = globals().get("PORTFOLIO")
+        if _portfolio is not None:
+            cls_gate = str(context.get("asset_class") or classification or "UNKNOWN").upper()
+            is_news = str(trade_type or "").upper() == "NEWS" or cls_gate == "NEWS"
+            total_open = int(_portfolio.count())
+            news_open = sum(1 for _pos in _portfolio.contexts.values() if _portfolio._ctx_class(_pos) == "NEWS")
+            tech_open = total_open - news_open
+            if total_open >= 6 or (is_news and news_open >= 1) or ((not is_news) and tech_open >= 5):
+                reason_cap = "NEWS_SLOT_FULL" if is_news and news_open >= 1 else "TECHNICAL_CAPACITY_FULL" if (not is_news and tech_open >= 5) else "TOTAL_CAPACITY_FULL"
+                _record_exec_blocker(symbol, "PORTFOLIO_CAPACITY", reason_cap, side, score)
+                return False
+    except Exception:
+        pass
     STATE["current_symbol"] = symbol
     STATE["trade_id"] = context.get("trade_id") or STATE.get("trade_id") or (TradeLifecycleJournal.new_trade_id(symbol) if TradeLifecycleJournal else f"TRD-{int(time.time()*1000)}")
     for _k, _default in (("zone_info", None), ("zone", None), ("zone_low", 0.0),
                          ("zone_high", 0.0), ("order_block", None), ("ob_grade", "NONE"),
                          ("position_setup_snapshot", None), ("research_decision_packet", None),
-                         ("research_challenge", None), ("close_reason", None)):
+                         ("research_challenge", None), ("close_reason", None),
+                         ("entry_dynamic_sl", 0.0), ("entry_dynamic_sl_basis", None),
+                         ("adaptive_entry_assessment", {}), ("adaptive_outcome", {}),
+                         ("forecast_evidence", {}), ("last_confirmed_sl", 0.0),
+                         ("protection_confirmed", False), ("be_ratchet_active", False),
+                         ("profit_protection_reason", None), ("management_action", None),
+                         ("management_reason", None), ("trail_stop", 0.0),
+                         ("runner_mode", False), ("trail_activated", False),
+                         ("tp1_closed_qty", 0.0), ("ema_vwap_management", {}),
+                         ("market_state", {}), ("market_regime", "UNKNOWN"),
+                         ("market_regime_legacy", "UNKNOWN"), ("position_vpa", {}),
+                         ("thesis_failure_score", 0.0), ("thesis_failure_raw_score", 0.0),
+                         ("thesis_failure_temporarily_suppressed", False),
+                         ("continuation_probability", 0.5), ("continuation_pressure", 50),
+                         ("counter_pressure", 0.0), ("reclaim_risk", 0.0),
+                         ("trend_strength", 0.5), ("hold_quality", "UNKNOWN")):
         STATE[_k] = _default
-    for _k in ("location", "narrative_classification", "narrative_confidence", "confidence_level", "institutional_stage", "move_maturity", "early_formation", "vpa", "news", "news_reaction", "asset_class"):
+    STATE["entry_intelligence_v2"] = _entry_intel_snapshot
+    if (str((_entry_intel_snapshot or {}).get("decision", "")).upper() == "APPROVE" and
+            float(sl or 0.0) > 0):
+        STATE["entry_dynamic_sl"] = float(sl)
+        STATE["entry_dynamic_sl_basis"] = STATE.get("entry_dynamic_sl_basis") or "ENTRY_THESIS"
+    for _k in ("location", "narrative_classification", "narrative_confidence", "confidence_level", "institutional_stage", "move_maturity", "early_formation", "vpa", "news", "news_reaction", "asset_class", "forecast_evidence"):
         if _k in context and context[_k] is not None:
             STATE[_k] = copy.deepcopy(context[_k])
     if context.get("reason") is not None:
@@ -9465,6 +10275,64 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         log_execution(f"[ENTRY] No valid OHLCV for {symbol}; refusing entry", "WARN")
         _record_exec_blocker(symbol, "DATA_REJECT",
                              "No valid OHLCV for entry", side, score)
+        return False
+
+    try:
+        _queue_obj = globals().get("queue")
+        _queue_cand = (_queue_obj._candidates.get(symbol)
+                       if _queue_obj is not None and hasattr(_queue_obj, "_candidates") else None)
+        _trace_id = str(context.get("decision_path_id") or
+                        getattr(_queue_cand, "decision_path_id", "") or
+                        f"{symbol}:execution:{int(time.time() * 1000)}")
+        _exec_snap = (
+            _decision_market_snapshot(df, side, float(atr_val or 0.0), float(price))
+            if _decision_market_snapshot is not None else {}
+        )
+        MEMORY.setdefault("decision_path_context", {})[symbol] = {
+            "trace_id": _trace_id, "side": side, "snapshot": _exec_snap,
+            "candidate_state": "EXECUTION", "candidate_score": float(score or 0.0),
+        }
+        if _emit_decision_path is not None:
+            _emit_decision_path(
+                trace_id=_trace_id, symbol=symbol, side=side, stage="EXECUTION_REQUEST",
+                decision="OPEN_REQUESTED", authority="execute_entry", source="process_queue_entry",
+                snapshot=_exec_snap,
+                fields={"score": float(score or 0.0), "trade_type": trade_type,
+                        "entry_type": entry_type, "classification": classification,
+                        "sl": sl, "tp1": tp1, "tp2": tp2},
+            )
+    except Exception:
+        pass
+
+    # ===== EARLY-TREND TIMING AUTHORITY =====================================
+    # Every automated technical path converges here before an order can be
+    # submitted. This closes the historical bypass where scanner/legacy paths
+    # could reach execute_entry after the move was already mature. EMA50/EMA200
+    # are still context; this gate only enforces *timing*, while the structural
+    # entry gates below remain responsible for the actual setup trigger.
+    _timing_atr = float(atr_val or 0.0)
+    if _timing_atr <= 0:
+        try:
+            _timing_atr = float(compute_atr(df).iloc[-1])
+        except Exception:
+            _timing_atr = 0.0
+    _timing_ok, _timing_info = _technical_entry_timing_gate(
+        symbol, side, df, float(price), _timing_atr, entry_type=entry_type)
+    STATE["entry_timing_guard"] = _timing_info
+    if not _timing_ok:
+        if _emit_decision_path is not None:
+            try:
+                _ctx = MEMORY.get("decision_path_context", {}).get(symbol, {})
+                _emit_decision_path(
+                    trace_id=str(_ctx.get("trace_id") or f"{symbol}:execution"),
+                    symbol=symbol, side=side, stage="EXECUTION_TIMING_GATE",
+                    decision="REJECT", authority="_technical_entry_timing_gate",
+                    source="execute_entry",
+                    reason=str((_timing_info or {}).get("reason") or "TIMING_REJECT"),
+                    snapshot=_ctx.get("snapshot") or {}, fields={"timing": _timing_info},
+                )
+            except Exception:
+                pass
         return False
 
     # ===== BARON ZONE/OB QUALITY JUDGE (additive gate; RORO entry logic untouched) =====
@@ -9561,6 +10429,19 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         STATE["ob_grade"] = _setup.get("ob_grade", "NONE")
     except Exception as _setup_exc:
         log_execution(f"[ENTRY_SETUP] snapshot failed: {_setup_exc}", "WARN")
+    if GLOBAL_ADAPTIVE_TRADE_INTELLIGENCE is not None:
+        try:
+            STATE["adaptive_entry_assessment"] = GLOBAL_ADAPTIVE_TRADE_INTELLIGENCE.assess_entry(STATE)
+            _ati = STATE["adaptive_entry_assessment"]
+            log_execution(
+                f"[AI_TRADE_COACH] {symbol} {side} -> {_ati.get('label')} "
+                f"samples={_ati.get('samples', 0)} conf={_ati.get('confidence', 0):.1f}% | "
+                f"{_ati.get('message', '')}",
+                "INFO" if _ati.get("label") != "HISTORICALLY_WEAK" else "WARN",
+                debounce_key=f"ati_entry_{symbol}", debounce_sec=30)
+        except Exception as _ati_exc:
+            STATE["adaptive_entry_assessment"] = {"available": False, "label": "UNAVAILABLE", "message": str(_ati_exc), "authority": "ADVISORY_ONLY"}
+            log_execution(f"[AI_TRADE_COACH] assessment unavailable: {_ati_exc}", "WARN", debounce_key="ati_assessment_error", debounce_sec=300)
     requested_asset_class = str(context.get("asset_class") or "").upper()
     asset_class = requested_asset_class if requested_asset_class == "NEWS" else AssetBehaviorProfile.resolve_asset_class(symbol)
     cfg = AssetBehaviorProfile.entry_config(asset_class)
@@ -9949,21 +10830,10 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "tp1_hit": False, "trail_on": False, "last_update_ts": time.time()
         })
         _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2, STATE.get("trade_id"))
-        if MODE_LIVE and REQUIRE_NATIVE_PROTECTION_LIVE and str(STATE.get("protection_status", "")).upper() != "PROTECTED":
-            log_execution(f"[LIVE_SAFETY] {symbol} entry rolled back: native SL was not confirmed", "ERROR")
-            try:
-                STATE["close_reason"] = "ENTRY_ROLLBACK"
-                close_position_full()
-            except Exception as _rollback_exc:
-                log_execution(f"[LIVE_SAFETY] protection rollback close failed: {_rollback_exc}", "ERROR")
-            return False
         _live_manager.set_entry_atr(atr_local)
         _live_manager._ensure_position_profile(symbol, price, side, atr_local,
                                                classification=classification,
                                                trade_type=trade_type)
-        STATE["dynamic_manager"] = DynamicTradeManager(
-            symbol, side, price, qty, atr_local, sl, tp1, tp2
-        )
         STATE["margin"] = margin
         STATE["qty"] = qty
         if paper["balance"] >= margin:
@@ -9980,8 +10850,26 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         log_execution(f"[EXECUTION] {symbol} {side} executed (paper) at {price:.4f}", "SUCCESS")
         _trade_event("OPEN_CONFIRMED", mode="PAPER", side=side, entry_price=price,
                      qty=qty)
+        # Start forensic capture only after the paper position, levels and
+        # lifecycle identity are fully initialized.
+        _partition_begin_active_trade(df=df_local)
+        _partition_observe_active_trade(df=df_local, price=price, force=True)
+        if _emit_decision_path is not None:
+            try:
+                _ctx = MEMORY.get("decision_path_context", {}).get(symbol, {})
+                _emit_decision_path(
+                    trace_id=str(_ctx.get("trace_id") or f"{symbol}:execution"),
+                    symbol=symbol, side=side, stage="OPEN", decision="OPEN_CONFIRMED",
+                    authority="execute_entry", source="paper_fill",
+                    snapshot=_ctx.get("snapshot") or {},
+                    fields={"mode": "PAPER", "entry_price": price, "qty": qty,
+                            "score": float(score or 0.0)},
+                )
+            except Exception:
+                pass
         STATE["exec_open_requested"] = False
         STATE["last_open_outcome"] = "OPEN_CONFIRMED"
+        _consume_stop_hunt_reentry(symbol)
         return True
 
     if not _native_protection_gate_ok(symbol, side, score, adx_val):
@@ -10053,9 +10941,6 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         _live_manager._ensure_position_profile(symbol, price, side, atr_local,
                                                classification=classification,
                                                trade_type=trade_type)
-        STATE["dynamic_manager"] = DynamicTradeManager(
-            symbol, side, price, qty, atr_local, sl, tp1, tp2
-        )
         if order.get("recovered"):
             # Order TIMEOUT -> exchange position adopted -> management now on.
             log_execution(
@@ -10067,12 +10952,58 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         log_execution(f"[EXECUTION] {symbol} {side} executed at {price:.4f}", "SUCCESS")
         _trade_event("OPEN_CONFIRMED", mode="LIVE", side=side, entry_price=price,
                      qty=qty)
+        if _emit_decision_path is not None:
+            try:
+                _ctx = MEMORY.get("decision_path_context", {}).get(symbol, {})
+                _emit_decision_path(
+                    trace_id=str(_ctx.get("trace_id") or f"{symbol}:execution"),
+                    symbol=symbol, side=side, stage="OPEN", decision="OPEN_CONFIRMED",
+                    authority="execute_entry", source="live_fill",
+                    snapshot=_ctx.get("snapshot") or {},
+                    fields={"mode": "LIVE", "entry_price": price, "qty": qty,
+                            "score": float(score or 0.0)},
+                )
+            except Exception:
+                pass
         STATE["exec_open_requested"] = False
         STATE["last_open_outcome"] = "OPEN_CONFIRMED"
+        if isinstance(order, dict):
+            _adopt_authoritative_entry_fill(STATE, order)
         time.sleep(1)
-        sync_position_state(symbol)
+        _post_entry_sync = sync_position_state(symbol)
+        # Entry lifecycle rule: venue position is authoritative. An accepted
+        # order without an authoritative position snapshot is UNKNOWN, not an
+        # active trade. The strict close path can safely reconcile/flatten only
+        # if the leg actually exists on BingX.
+        if MODE_LIVE and not _post_entry_exchange_confirmation_ok(STATE, _post_entry_sync):
+            STATE["close_reason"] = "ENTRY_POSITION_UNVERIFIED"
+            log_execution(f"[LIVE_SAFETY] {symbol} entry blocked: BingX position not authoritatively verified after order fill", "ERROR")
+            self_close = globals().get("_live_manager")
+            if self_close is not None and hasattr(self_close, "_execute_action"):
+                self_close._execute_action("FORCE_EXIT", reason="ENTRY_POSITION_UNVERIFIED", stage="ENTRY_POSITION_UNVERIFIED")
+            else:
+                log_execution("[LIVE_SAFETY] entry rollback blocked: unified management authority unavailable", "ERROR")
+            return False
+        _adopt_authoritative_entry_fill(STATE, {"filled": STATE.get("qty"), "average": STATE.get("entry")})
+        # Entry lifecycle rule: venue position is authoritative. Protection is
+        # installed only after that position has been fetched from BingX.
+        _np = _ensure_native_protection(symbol)
+        if MODE_LIVE and REQUIRE_NATIVE_PROTECTION_LIVE and str(_np.get("status", "")).upper() != "PROTECTED":
+            log_execution(f"[LIVE_SAFETY] {symbol} entry blocked: protection not verified after position sync", "ERROR")
+            STATE["close_reason"] = "ENTRY_ROLLBACK"
+            self_close = globals().get("_live_manager")
+            if self_close is not None and hasattr(self_close, "_execute_action"):
+                self_close._execute_action("FORCE_EXIT", reason="ENTRY_ROLLBACK", stage="ENTRY_ROLLBACK")
+            else:
+                log_execution("[LIVE_SAFETY] protection rollback blocked: unified management authority unavailable", "ERROR")
+            return False
         _reconcile_levels_after_fill(STATE.get("entry", price), symbol, side, trade_type,
                                      classification, atr_local, force_validate=True)
+        # Begin Partition only after BingX position + native protection have
+        # both passed the authoritative LIVE safety checks.
+        _partition_begin_active_trade(df=df_local)
+        _partition_observe_active_trade(df=df_local, price=STATE.get("entry", price), force=True)
+        _consume_stop_hunt_reentry(symbol)
         return True
     else:
         _record_exec_blocker(symbol, "EXECUTION_REJECT",
@@ -11083,6 +12014,11 @@ def detect_market_regime(df):
 
 def get_trend_direction(df):
     try:
+        if GLOBAL_INSTITUTIONAL_ENTRY_ENGINE is not None and is_valid_dataframe(df) and len(df) >= 200:
+            ctx = GLOBAL_INSTITUTIONAL_ENTRY_ENGINE.compute_direction_context(df, float(df['close'].iloc[-1]))
+            bias = str(ctx.get("bias", "UNKNOWN")).upper()
+            if bias in {"BULLISH", "BEARISH"}:
+                return bias
         plus_di, minus_di, _, _ = get_di_components(df)
         ema20 = ema(df['close'], 20).iloc[-1]
         ema50 = ema(df['close'], 50).iloc[-1] if len(df)>=50 else ema20
@@ -11524,21 +12460,19 @@ def scaling_logic(symbol, df, ind):
     return False
 
 def council_exit(df, price):
+    """Legacy advisory signal provider; NEVER executes a close."""
     adx_series = compute_adx(df)
     adx = adx_series.iloc[-1] if adx_series is not None else 0
     if adx < 18:
-        log_execution(f"Exit: ADX dropped to {adx:.1f}", "WARN")
-        close_position_full()
+        log_execution(f"[COUNCIL] exit evidence: ADX={adx:.1f}", "WARN")
         return True
-    if STATE["side"] == "BUY" and price < STATE.get("synthetic_sl", 0):
-        log_execution(f"Stop loss hit at {price:.4f}", "WARN")
-        tg_sl_hit(STATE["current_symbol"], (price - STATE["entry"])/STATE["entry"]*100 if STATE["side"]=="BUY" else (STATE["entry"]-price)/STATE["entry"]*100)
-        close_position_full()
+    side = str(STATE.get("side", "")).upper()
+    sl = float(STATE.get("synthetic_sl", 0) or 0)
+    if side == "BUY" and sl > 0 and price < sl:
+        log_execution(f"[COUNCIL] stop evidence at {price:.4f}", "WARN")
         return True
-    elif STATE["side"] == "SELL" and price > STATE.get("synthetic_sl", 0):
-        log_execution(f"Stop loss hit at {price:.4f}", "WARN")
-        tg_sl_hit(STATE["current_symbol"], (STATE["entry"]-price)/STATE["entry"]*100)
-        close_position_full()
+    if side == "SELL" and sl > 0 and price > sl:
+        log_execution(f"[COUNCIL] stop evidence at {price:.4f}", "WARN")
         return True
     return False
 
@@ -12847,6 +13781,7 @@ def data():
             "external_intelligence_top": MEMORY.get("external_intelligence_top", []),
             "external_intelligence_status": MEMORY.get("external_intelligence_status", "INIT"),
             "external_intelligence_last_scan": MEMORY.get("external_intelligence_last_scan", 0),
+            "partition_ai": DASHBOARD_STATE.get("partition_ai", GLOBAL_PARTITION_AI.status() if _partition_enabled() else {"enabled": False}),
             "last_live_refresh": DASHBOARD_STATE.get("last_live_refresh", time.time()),
             **live_data
         }
@@ -12893,14 +13828,12 @@ def manual_close():
         return jsonify({"error": "No position"}),400
     price = get_ticker_safe(STATE["current_symbol"])
     STATE["close_reason"] = "MANUAL_CLOSE"
-    # Verified close path: close_position_full() handles paper (exact price +
-    # margin release) AND live (venue reduce-only order + fill verification +
-    # state sync) and calls finalize_trade_with_reality internally. Calling
-    # finalize again here would double-book the trade. Fixes the previous
-    # inversion where a live close with an available ticker book-kept locally
-    # without ever sending the reduce-only order, and the recovery scan
-    # re-adopted the still-open venue position.
-    ok = close_position_full(close_price=price, stage="MANUAL")
+    # Manual control is an authority request only. Execution and verification
+    # remain exclusively inside the unified management/execution path.
+    _lm = globals().get("_live_manager")
+    if _lm is None or not hasattr(_lm, "_execute_action"):
+        return jsonify({"message": "Close failed", "reason": "Unified management authority unavailable"}), 503
+    ok = bool(_lm._execute_action("FORCE_EXIT", reason="MANUAL_CLOSE", stage="MANUAL", close_price=price))
     return jsonify({"message": "Closed" if ok else "Close failed"}),200 if ok else 500
 
 @app.route("/health")
@@ -13259,11 +14192,6 @@ def sync_all_states():
     valid = validate_position_state(STATE, symbol)
     if valid is None:
         log_execution(f"[SYNC] Position on {symbol} closed externally – finalizing realized outcome before local cleanup.", "WARN")
-        # The venue stopped reporting the position (authoritative NOT_FOUND).
-        # Tag the realized close so the telegram reason is never "UNKNOWN" and
-        # re-adoptions of the same physical position stay deduplicated.
-        STATE["close_reason"] = STATE.get("close_reason") or "EXTERNAL_CLOSE"
-        STATE["last_management_event"] = STATE.get("close_reason")
         try:
             finalize_trade_with_reality(symbol)
         except Exception as _finalize_exc:
@@ -13283,26 +14211,10 @@ def sync_all_states():
     _set_wallet_pnl_memory(real_pnl, real_pnl_pct)
 
 def validate_position_state(local_pos, symbol):
-    """Verify a live position against the venue WITHOUT conflating transport
-    failures with a real close.
-
-    Returns:
-      None       -> position is authoritatively NOT_FOUND on the venue (real close)
-      local_pos  -> position still open, OR venue query was PAUSED/ERROR and the
-                    local state must be preserved (never finalize on a failed
-                    query)
-      real_pos   -> venue-reported position (OK)
-    """
-    real_pos, status = fetch_position_status(symbol)
-    if status == "NOT_FOUND":
+    real_pos = fetch_position(symbol)
+    if real_pos is None:
         return None
-    if status == "OK":
-        return real_pos
-    if status == "PAUSED":
-        log_execution(f"[SYNC] {symbol} is PAUSED on the venue; local state preserved (never converted into a close)", "WARN", debounce_key=f"sync_paused_{symbol}", debounce_sec=60)
-        return local_pos
-    log_execution(f"[SYNC] {symbol} venue query ERROR; local state preserved (never converted into a close)", "WARN", debounce_key=f"sync_error_{symbol}", debounce_sec=60)
-    return local_pos
+    return real_pos
 
 _external_intel_service = None
 _external_intel_alerted = {}
@@ -13525,9 +14437,14 @@ def main_loop_sniper():
             if emergency_kill_switch_active():
                 if STATE["open"]:
                     STATE["close_reason"] = "EMERGENCY_EXIT"
-                    close_position_full()
+                    # Safety is an authority trigger, not a second trade manager.
+                    _lm = globals().get("_live_manager")
+                    if _lm is not None and hasattr(_lm, "_execute_action"):
+                        _lm._execute_action("FORCE_EXIT", reason="EMERGENCY_EXIT", stage="EMERGENCY_EXIT")
+                    else:
+                        log_execution("[SAFETY] emergency close blocked: unified management authority unavailable", "ERROR")
                     clear_position_dashboard()
-                    TRADE_STATE["in_position"] = False
+                    TRADE_STATE["in_position"] = bool(STATE.get("open"))
                 time.sleep(60)
                 continue
             print_snapshot()
@@ -14301,6 +15218,21 @@ def record_gate_event(symbol, stage, blocker, detail="", side=""):
                 decision="VETO" if blocker else "OBSERVE",
                 reason=blocker, detail=detail,
             )
+        if _emit_decision_path is not None:
+            try:
+                _ctx = (MEMORY.get("decision_path_context") or {}).get(symbol, {})
+                _emit_decision_path(
+                    trace_id=str(_ctx.get("trace_id") or f"{symbol}:gate"),
+                    symbol=symbol, side=side or _ctx.get("side", ""),
+                    stage=stage, decision="REJECT" if blocker else "OBSERVE",
+                    reason=str(blocker or ""), authority="GATE_EVENT",
+                    source="record_gate_event", snapshot=_ctx.get("snapshot") or {},
+                    fields={"detail": str(detail)[:500], "gate_blocker": blocker,
+                            "candidate_state": _ctx.get("candidate_state"),
+                            "candidate_score": _ctx.get("candidate_score")},
+                )
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -14465,22 +15397,6 @@ class ExecutionCandidate:
     confidence_level: str = ""
     move_maturity: str = "UNKNOWN"
     early_formation: dict = field(default_factory=dict)
-
-    def __post_init__(self):
-        # FAIL-CLOSED custody of the legacy "CRYPTO" default: a TradFi family
-        # symbol (NCSK/NCSI/NCCO/NCFX) must resolve to its REAL class up-front,
-        # so an omitted asset_class can never silently plant a
-        # stock/ETF/index/commodity/forex candidate into the CRYPTO bucket.
-        # Non-family, venue-pair symbols (USDT/USDC quote) keep the CRYPTO
-        # default; any other shape (malformed / metadata-free) resolves through
-        # the authoritative classifier to UNKNOWN — never CRYPTO.
-        if self.asset_class == "CRYPTO" and self.symbol:
-            up = str(self.symbol).upper()
-            if (up.split("/")[0].startswith(("NCSI", "NCSK", "NCCO", "NCFX"))
-                    or ("USDT" not in up and "USDC" not in up)):
-                resolved = AssetBehaviorProfile.resolve_asset_class(self.symbol)
-                if resolved and resolved != "CRYPTO":
-                    self.asset_class = resolved
 
     def zone_mid(self) -> float:
         if self.zone_low and self.zone_high:
@@ -15807,17 +16723,6 @@ class ExecutionQueue:
             return
         with self._lock:
             for symbol, cand in list(self._candidates.items()):
-                # Terminal states must never be re-evaluated (they are awaiting
-                # cleanup only). Skipping here prevents a resurrected READY
-                # reprocessing a just-opened or invalidated candidate.
-                # NOTE: RETURNED_WATCHLIST is deliberately NOT terminal — the
-                # zone-lifecycle contract requires returned candidates to be
-                # re-evaluated so an escaped zone can advance EXPANDED_AWAY ->
-                # STALE (and _update_zone_lifecycle below keeps genuinely
-                # returned/invalidated candidates from reaching READY).
-                if cand.state in (ExecutionState.EXECUTED,
-                                  ExecutionState.INVALIDATED):
-                    continue
                 if (cand.institutional_score >= 70 and
                     cand.pre_institutional_state in ("CONFIRMED", "PRE_ENTRY_READY")):
                     df = data_fetcher(symbol)
@@ -15857,6 +16762,55 @@ class ExecutionQueue:
                 current_price = df['close'].iloc[-1]
                 atr = compute_atr(df).iloc[-1] if len(df) > 14 else current_price * 0.01
                 cand.atr = atr
+                try:
+                    _trace_id = str(getattr(cand, "decision_path_id", "") or
+                                    f"{symbol}:queue:{int((cand.queue_time or cand.added_at or time.time()) * 1000)}")
+                    cand.decision_path_id = _trace_id
+                    _trace_snapshot = (
+                        _decision_market_snapshot(df, cand.side, float(atr), float(current_price))
+                        if _decision_market_snapshot is not None else {}
+                    )
+                    MEMORY.setdefault("decision_path_context", {})[symbol] = {
+                        "trace_id": _trace_id, "side": cand.side, "snapshot": _trace_snapshot,
+                        "candidate_state": cand.state.value, "candidate_score": float(cand.priority_score),
+                    }
+                    if _emit_decision_path is not None:
+                        _emit_decision_path(
+                            trace_id=_trace_id, symbol=symbol, side=cand.side,
+                            stage="QUEUE_REEVALUATION", decision="OBSERVE",
+                            authority="ExecutionQueue.re_evaluate_all", source="live_revalidation",
+                            snapshot=_trace_snapshot,
+                            fields={"candidate_state": cand.state.value,
+                                    "priority_score": float(cand.priority_score),
+                                    "institutional_score": float(cand.institutional_score),
+                                    "pre_institutional_state": cand.pre_institutional_state,
+                                    "move_maturity": cand.move_maturity,
+                                    "zone_low": float(cand.zone_low or 0.0),
+                                    "zone_high": float(cand.zone_high or 0.0)},
+                        )
+                except Exception:
+                    pass
+                # ===== Unified Institutional Evidence Packet =====
+                # Closed-candle, deterministic, advisory evidence. It is stored on
+                # the candidate so scanner, queue, execution snapshot and audit
+                # trail can inspect the SAME packet instead of recomputing ad hoc.
+                try:
+                    _ob_hint = {
+                        "present": bool(cand.zone_low > 0 and cand.zone_high > 0),
+                        "quality": float(getattr(cand, "ob_grade", "NONE") in ("A+", "A")) * 100.0,
+                        "low": float(getattr(cand, "zone_low", 0.0) or 0.0),
+                        "high": float(getattr(cand, "zone_high", 0.0) or 0.0),
+                        "origin_bar": int(getattr(cand, "zone_origin_bar", -1) or -1),
+                    }
+                    cand.evidence["institutional_evidence"] = analyze_institutional_evidence(
+                        df, cand.side, atr=float(atr), ob_hint=_ob_hint if _ob_hint["present"] else None
+                    )
+                    cand.evidence["forecast_evidence"] = analyze_forecast_evidence(
+                        df, cand.side, atr=float(atr)
+                    )
+                except Exception as _inst_ev_err:
+                    cand.evidence["institutional_evidence"] = {"available": False, "reason": str(_inst_ev_err)}
+                    log_execution(f"[INST-EVIDENCE] {symbol} degraded: {_inst_ev_err}", "WARN", debounce_key=f"inst_evidence_{symbol}", debounce_sec=120)
                 # Live move-maturity revalidation: admission-time maturity is a
                 # hint only.  Late/exhausted moves are returned to discovery so
                 # a fast-path cannot chase an already-expanded move.
@@ -16203,6 +17157,32 @@ class ExecutionQueue:
                 self._update_state(cand, current_price)
                 self._record_opportunity_lifecycle(cand)
                 self.total_evaluations += 1
+                if _emit_decision_path is not None:
+                    try:
+                        _ctx = MEMORY.get("decision_path_context", {}).get(symbol, {})
+                        _ctx["candidate_state"] = cand.state.value
+                        _ctx["candidate_score"] = float(cand.priority_score)
+                        _ctx["snapshot"] = (
+                            _decision_market_snapshot(df, cand.side, float(atr), float(current_price))
+                            if _decision_market_snapshot is not None else (_ctx.get("snapshot") or {})
+                        )
+                        MEMORY.setdefault("decision_path_context", {})[symbol] = _ctx
+                        _emit_decision_path(
+                            trace_id=str(getattr(cand, "decision_path_id", "") or _ctx.get("trace_id") or f"{symbol}:queue"),
+                            symbol=symbol, side=cand.side, stage="QUEUE_STATE",
+                            decision=cand.state.value, authority="ExecutionQueue._update_state",
+                            source="ready_gate", reason=str(cand.ready_blocker or ""),
+                            snapshot=_ctx.get("snapshot") or {},
+                            fields={"gate_status": cand.gate_status,
+                                    "confirmation_count": cand.confirmation_count,
+                                    "trigger": cand.zone_metrics.trigger_state,
+                                    "zone_state": cand.zone_state,
+                                    "priority_score": float(cand.priority_score),
+                                    "atom_hard_reject": bool(cand.atom_hard_reject),
+                                    "institutional_score": float(cand.institutional_score)},
+                        )
+                    except Exception:
+                        pass
                 if cand.priority_score < 30:
                     self.gate_stats["score_too_low"] += 1
                     record_gate_event(symbol, "QUEUE", "SCORE_TOO_LOW",
@@ -17177,6 +18157,15 @@ class ExecutionQueue:
             (sq in ("strong", "weak") or ev.get("ob_sweep_aligned", False))
             and (ev.get("ob_fvg_after_displacement", False) or ev.get("ob_pd_aligned", False))
         )
+        inst_ev = ev.get("institutional_evidence", {}) if isinstance(ev.get("institutional_evidence", {}), dict) else {}
+        inst_seq = inst_ev.get("sequence", {}) if isinstance(inst_ev.get("sequence", {}), dict) else {}
+        # The new evidence layer is a distinct confirmation family only when
+        # it observes a valid causal sequence. It cannot create a family from
+        # raw indicators alone.
+        families["institutional_sequence"] = bool(
+            inst_ev.get("available") and inst_seq.get("valid_for_entry") and
+            float(inst_ev.get("confluence_score", 0.0) or 0.0) >= 70.0
+        )
         n_families = sum(1 for v in families.values() if v)
         confirmed = [k for k, v in families.items() if v]
         eq = 25.0 + n_families * 15.0
@@ -17202,6 +18191,7 @@ class ExecutionQueue:
             f"families={n_families}({'+'.join(confirmed)})",
             f"composite={composite}", f"evidence_q={eq:.0f}", f"trap_risk={trap_risk}",
             f"sweep={sq}",
+            f"inst_sequence={inst_seq.get('state', 'UNAVAILABLE')}",
         ]
         return label, composite, trap_risk
 
@@ -17367,6 +18357,10 @@ class ExecutionQueue:
         cand.decision_label = label
         evidence_ok = not label.startswith("INVALID")
         trigger_gate = trigger in ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED")
+        inst_ev = cand.evidence.get("institutional_evidence", {}) if isinstance(cand.evidence, dict) else {}
+        inst_seq = inst_ev.get("sequence", {}) if isinstance(inst_ev, dict) else {}
+        inst_gate_enabled = os.getenv("INSTITUTIONAL_SEQUENCE_HARD_GATE", "0").strip().lower() in {"1", "true", "yes", "on"}
+        inst_gate_ok = (not inst_gate_enabled) or bool(inst_ev.get("available") and inst_seq.get("valid_for_entry"))
         if cand.institutional_prepared and trigger == "RETEST_CONFIRMED":
             trigger_gate = True
 
@@ -17429,6 +18423,7 @@ class ExecutionQueue:
             "evidence": "PASS" if evidence_ok else f"FAIL({label})",
             "adx": adx_gate_status,
             "atom": atom_gate_status,
+            "institutional_sequence": ("PASS" if inst_gate_ok else "FAIL_SEQUENCE"),
         }
 
         # Explicit, machine-readable primary blocker. A non-READY candidate is
@@ -17469,6 +18464,10 @@ class ExecutionQueue:
         elif not evidence_ok:
             blocker = "EVIDENCE"
             reasons = {"label": label}
+        elif not inst_gate_ok:
+            blocker = "INSTITUTIONAL_SEQUENCE"
+            reasons = {"sequence": inst_seq.get("state", "UNAVAILABLE"),
+                       "confluence_score": inst_ev.get("confluence_score", 0.0)}
 
         cand.ready_blocker = blocker
         cand.ready_blocker_reasons = reasons
@@ -17500,7 +18499,7 @@ class ExecutionQueue:
                 log_execution(f"[LATENCY] {cand.symbol}: institutional_analysis_time missing", "WARN")
         if conf_ok:
             if (score >= ready_required and trigger_gate and in_entry_window
-                    and evidence_ok and atom_gate_ok and adx_ok):
+                    and evidence_ok and atom_gate_ok and adx_ok and inst_gate_ok):
                 was_ready = cand.state == ExecutionState.READY
                 cand.state = ExecutionState.READY
                 cand.confirmation_state = "CONFIRMED_1" if min_confirmations == 1 else "CONFIRMED_2"
@@ -17721,6 +18720,7 @@ def get_ready_candidates():
                     "zone_high": float(getattr(cand, "zone_high", 0.0) or 0.0),
                     "ob_grade": getattr(cand, "ob_grade", "NONE"),
                     "vpa": (getattr(cand, "evidence", {}) or {}).get("vpa", {}),
+                    "forecast_evidence": (getattr(cand, "evidence", {}) or {}).get("forecast_evidence", {}),
                 })
     return candidates
 
@@ -17738,7 +18738,67 @@ def process_queue_entry():
     if best.state != ExecutionState.READY:
         return
     price, atr = _live_entry_context(best.symbol, best.price, best.atr)
-    sl, tp1, tp2 = compute_sl_tp(price, best.side, "REVERSAL", atr, None)
+    # Technical queue candidates must pass the same single Trend v29 authority
+    # at the live trigger. News remains an independent slot.
+    _queue_trade_type = str(getattr(best, "trade_type", "") or "").upper()
+    if _queue_trade_type != "NEWS":
+        _trend_strategy = globals().get("GLOBAL_TREND_STRATEGY_V29")
+        if _trend_strategy is None:
+            log_execution("[TREND_V29] queue gate unavailable; technical queue entry blocked", "ERROR")
+            return
+        _live_df = get_ohlcv_safe(best.symbol, 120)
+        _live_ob = get_orderbook_cached(best.symbol, limit=10)
+        if _live_df is None or not validate_dataframe(_live_df, 80):
+            log_execution(f"[TREND_V29] queue blocked {best.symbol}: invalid live OHLCV", "INFO")
+            return
+        _live_rf = RFEngine(20, 3.5).compute(_live_df)
+        _trend_decision = _trend_strategy.evaluate(best.symbol, best.side, _live_df, _live_ob, _live_rf)
+        MEMORY[f"trend_v29_{best.symbol}"] = _trend_decision.to_dict()
+        if _emit_decision_path is not None:
+            try:
+                _tid = str(getattr(best, "decision_path_id", "") or f"{best.symbol}:queue")
+                _snap = _decision_market_snapshot(
+                    _live_df, best.side, float(atr), float(price)
+                ) if _decision_market_snapshot is not None else {}
+                _emit_decision_path(
+                    trace_id=_tid, symbol=best.symbol, side=best.side,
+                    stage="TREND_V29_GATE",
+                    decision="APPROVE" if _trend_decision.approved else "REJECT",
+                    authority="BaronTrendStrategyV29", source="process_queue_entry",
+                    reason=str(_trend_decision.reason or ""),
+                    snapshot=_snap,
+                    fields={"metrics": _trend_decision.metrics, "sl": _trend_decision.sl,
+                            "tp1": _trend_decision.tp1, "tp2": _trend_decision.tp2,
+                            "pullback": (_trend_decision.metrics.get("pullback") or {})},
+                )
+                MEMORY.setdefault("decision_path_context", {})[best.symbol] = {
+                    "trace_id": _tid, "side": best.side, "snapshot": _snap,
+                    "candidate_state": "TREND_V29", "candidate_score": float(best.priority_score),
+                }
+            except Exception:
+                pass
+        if not _trend_decision.approved:
+            log_execution(
+                f"[TREND_V29] queue blocked {best.symbol} {best.side}: "
+                f"{_trend_decision.reason} | pullback={(_trend_decision.metrics.get('pullback') or {}).get('state')}",
+                "INFO",
+            )
+            return
+        sl, tp1, tp2 = _trend_decision.sl, _trend_decision.tp1, _trend_decision.tp2
+        _trend_context = dict(_trend_decision.context or {})
+        _trend_context["asset_class"] = AssetBehaviorProfile.resolve_asset_class(best.symbol)
+        _trend_context["entry_intelligence_v2"] = {
+            "decision": "APPROVE",
+            "side": best.side,
+            "thesis": {"invalidation": _trend_decision.sl, "side": best.side},
+            "liquidity_event": {
+                "level": _trend_decision.metrics.get("sweep_level"),
+                "quality": _trend_decision.metrics.get("target_attraction", 0.0),
+            },
+        }
+    else:
+        _trend_context = {}
+        sl, tp1, tp2 = compute_sl_tp(price, best.side, "REVERSAL", atr, None)
     log_execution(f"[QUEUE] Executing best candidate {best.symbol} {best.side} (score={best.priority_score} live_price={price})", "INFO")
     # Thread the Atom classification (TREND / REVERSAL / SNIPER_REVERSAL) through
     # to position management so the open trade is managed by its real thesis
@@ -17747,12 +18807,16 @@ def process_queue_entry():
     execute_entry(best.side, best.symbol, price, sl, tp1, tp2, best.priority_score, best.original_reason,
                   atr, manage_type, "EXECUTION_QUEUE", classification="INSTITUTIONAL_SNIPER",
                   context={
+                      **_trend_context,
                       "trade_id": getattr(best, "trade_id", "") or getattr(best, "candidate_id", ""),
                       "zone_low": float(getattr(best, "zone_low", 0.0) or 0.0),
                       "zone_high": float(getattr(best, "zone_high", 0.0) or 0.0),
                       "ob_grade": getattr(best, "ob_grade", "NONE"),
                       "vpa": (getattr(best, "evidence", {}) or {}).get("vpa", {}),
+                      "institutional_evidence": (getattr(best, "evidence", {}) or {}).get("institutional_evidence", {}),
+                      "forecast_evidence": (getattr(best, "evidence", {}) or {}).get("forecast_evidence", {}),
                       "zone": getattr(best, "zone_info", None),
+                      "decision_path_id": getattr(best, "decision_path_id", ""),
                   })
 
 # ========== MAIN EXECUTION ==========

@@ -3,6 +3,11 @@
 The scanner imports the core namespace after the core module is fully loaded.
 """
 import core.engine as E
+try:
+    from core.decision_path_telemetry import emit as emit_decision_path, market_snapshot as decision_market_snapshot
+except Exception:
+    emit_decision_path = None
+    decision_market_snapshot = None
 # Make the core runtime namespace available to legacy scanner functions without duplicating state.
 globals().update({k:v for k,v in vars(E).items() if not k.startswith('__')})
 
@@ -1071,20 +1076,6 @@ def _safe_numeric(value, default=50.0):
         return float(default)
 
 
-def _has_live_context(symbol):
-    """True when a real (already-open) position exists for symbol.
-
-    Imported lazily to avoid the scanner<->runtime import cycle; this guard is
-    only reachable at call time when core.runtime has already loaded the shared
-    portfolio singleton. It blocks NEW OPEN re-admission of a LIVE position.
-    """
-    try:
-        from core.runtime import PORTFOLIO
-        return bool(PORTFOLIO is not None and PORTFOLIO._has_context(symbol))
-    except Exception:
-        return False
-
-
 def promote_to_queue():
     """Prepare early institutional candidates for live execution re-evaluation.
 
@@ -1103,22 +1094,34 @@ def promote_to_queue():
         return 0
 
     reject_reasons = {}
-    def _rej(reason):
+    def _rej(reason, sym=None, entry=None):
         reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
+        if emit_decision_path is not None and sym:
+            try:
+                emit_decision_path(
+                    trace_id=str((entry or {}).get("_decision_path_id") or f"{sym}:promotion"),
+                    symbol=sym, side=str((entry or {}).get("side", "")).upper(), stage="PROMOTION_REJECT",
+                    decision="REJECT", authority="promote_to_queue", source="InstitutionalZoneRegistry",
+                    reason=str(reason), fields={"promotion_reason": str(reason), "score": (entry or {}).get("score"),
+                                                "institutional_zone_active": (entry or {}).get("institutional_zone_active"),
+                                                "precursor_count": (entry or {}).get("precursor_count")},
+                )
+            except Exception:
+                pass
 
     checked = eligible = 0
     promoted = 0
     for sym, zentry in list(registry.items()):
         entry = watchlist.get(sym)
         if not isinstance(entry, dict):
-            _rej("missing_watchlist_entry")
+            _rej("missing_watchlist_entry", sym, entry)
             continue
         checked += 1
         if not entry.get("deep_analyzed"):
-            _rej("not_deep_analyzed")
+            _rej("not_deep_analyzed", sym, entry)
             continue
         if not entry.get("institutional_zone_active"):
-            _rej("institutional_zone_inactive")
+            _rej("institutional_zone_inactive", sym, entry)
             continue
         is_a_grade = bool(entry.get("a_grade_ready"))
         precursor_count = int(entry.get("precursor_count", 0) or 0)
@@ -1131,7 +1134,7 @@ def promote_to_queue():
             })
         is_prepared = bool(entry.get("institutional_prepared")) and precursor_count >= 2
         if not is_a_grade and not is_prepared:
-            _rej("not_prepared_or_a_grade")
+            _rej("not_prepared_or_a_grade", sym, entry)
             continue
 
         # Promotion is structural/institutional only. News may contribute to
@@ -1152,37 +1155,31 @@ def promote_to_queue():
         # for queue preparation, while the queue performs the fresh structural
         # and trigger checks before READY/ENTRY.
         if is_a_grade and structural_hits < 2:
-            _rej("insufficient_structural_evidence")
+            _rej("insufficient_structural_evidence", sym, entry)
             continue
         if not is_a_grade and structural_hits < 1 and precursor_count < 2:
-            _rej("insufficient_prepared_evidence")
+            _rej("insufficient_prepared_evidence", sym, entry)
             continue
         entry["structural_evidence"] = structural_evidence
         entry["structural_evidence_count"] = structural_hits
 
         phase = str((entry.get("pre_expansion") or {}).get("phase", "NEUTRAL")).upper()
         if phase in {"OVEREXTENDED", "EXHAUSTION", "INVALIDATED"}:
-            _rej("late_or_invalidated")
+            _rej("late_or_invalidated", sym, entry)
             continue
         if sym in queue._candidates:
-            _rej("already_in_queue")
-            continue
-        if _has_live_context(sym):
-            _rej("position_already_open")
-            E.record_gate_event(sym, "PROMOTION", "POSITION_ALREADY_OPEN",
-                                "LIVE position exists (PORTFOLIO.contexts); NEW OPEN admission blocked",
-                                str(entry.get("side", "BUY")).upper())
+            _rej("already_in_queue", sym, entry)
             continue
         eligible += 1
 
         df = get_ohlcv_safe(sym, 100)
         if df is None or len(df) < 30:
-            _rej("no_fresh_data")
+            _rej("no_fresh_data", sym, entry)
             continue
         price = float(df["close"].iloc[-1])
         atr = float(compute_atr(df).iloc[-1]) if len(df) > 14 else price * 0.01
         if price <= 0 or atr <= 0:
-            _rej("invalid_price_atr")
+            _rej("invalid_price_atr", sym, entry)
             continue
         ob = get_orderbook_cached(sym, limit=10)
         side = str(entry.get("side", "BUY")).upper()
@@ -1193,7 +1190,7 @@ def promote_to_queue():
         if zl_c and zh_c:
             dist_atr = abs(price - (zl_c + zh_c) / 2.0) / atr
             if dist_atr > max_ext_atr:
-                _rej("entry_window_missed")
+                _rej("entry_window_missed", sym, entry)
                 E.record_gate_event(sym, "PROMOTION", "ENTRY_WINDOW_MISSED",
                                     f"price {dist_atr:.2f} ATR from causal OB mid; stays in institutional analysis", side)
                 continue
@@ -1202,7 +1199,7 @@ def promote_to_queue():
         if stale:
             zl, zh, _zb, _zt = queue._find_causal_ob_zone(df, side, atr, qcfg)
             if zl and zh and abs(zl - stale.get("zone_low", 0)) < atr * 0.5 and abs(zh - stale.get("zone_high", 0)) < atr * 0.5:
-                _rej("stale_zone_guard")
+                _rej("stale_zone_guard", sym, entry)
                 continue
 
         sl, tp1, tp2 = compute_sl_tp(price, side, "REVERSAL", atr, df)
@@ -1257,12 +1254,6 @@ def promote_to_queue():
             zone_state="ACTIVE", ob_cfg=qcfg
         )
         candidate.state = ExecutionState.DISCOVERED
-        # FAIL-CLOSED classification carry (forensic): the watch entry may carry
-        # an authoritative class; otherwise resolve from the symbol so a TradFi
-        # candidate can never ride the CRYPTO dataclass default into the bucket.
-        candidate.asset_class = (
-            str(entry.get("asset_class") or "")).upper() or \
-            E.AssetBehaviorProfile.resolve_asset_class(sym)
         candidate.priority_score = metrics.final_zone_score
         candidate.is_a_grade = is_a_grade
         candidate.strong_ob_present = str(analysis.get("ob_grade", "NONE")).upper() in {"A", "A+"}
@@ -1312,6 +1303,23 @@ def promote_to_queue():
 
         if queue.add_candidate(candidate):
             promoted += 1
+            candidate.decision_path_id = str(entry.get("_decision_path_id") or f"{sym}:queue:{time.time_ns()}")
+            if emit_decision_path is not None:
+                try:
+                    _snap = decision_market_snapshot(df, side, atr, price) if decision_market_snapshot else {}
+                    emit_decision_path(
+                        trace_id=candidate.decision_path_id, symbol=sym, side=side, stage="QUEUE_ADMITTED",
+                        decision="ADMIT", authority="ExecutionQueue.add_candidate", source="promote_to_queue",
+                        snapshot=_snap, fields={"priority_score": float(candidate.priority_score),
+                                                 "original_score": float(candidate.original_score),
+                                                 "zone_low": candidate.zone_low, "zone_high": candidate.zone_high,
+                                                 "ob_grade": candidate.ob_grade, "is_a_grade": candidate.is_a_grade,
+                                                 "institutional_score": candidate.institutional_score,
+                                                 "pre_institutional_state": candidate.pre_institutional_state,
+                                                 "precursor_count": candidate.precursor_count},
+                    )
+                except Exception:
+                    pass
             candidate.queue_time = time.time()
             candidate.prepared_time = time.time()
             entry["queue_promoted_at"] = time.time()

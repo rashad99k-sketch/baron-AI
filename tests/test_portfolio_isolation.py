@@ -68,6 +68,26 @@ class PortfolioCapacityPolicyTest(unittest.TestCase):
             os.environ.pop("MAX_POSITIONS_PER_ASSET_CLASS", None)
 
 
+class _TestUnifiedManager:
+    """Minimal test seam for the canonical Brain -> ExecutionService boundary.
+
+    The production PortfolioManager must never call engine close primitives
+    directly.  This adapter gives the fake engine the same public management
+    action boundary as the real LiveTradeManager.
+    """
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def _execute_action(self, action, **kwargs):
+        if str(action).upper() == "FORCE_EXIT":
+            return bool(self.engine.close_position_full())
+        return True
+
+    def dispose(self):
+        return None
+
+
 class PaperMarginEngine:
     """Fake engine with realistic 6-position margin accounting (mirrors edits
     applied to core/engine.py): each open commits 10% of free balance into
@@ -108,7 +128,7 @@ class PaperMarginEngine:
         self.paper["balance"] -= margin
         self.paper["committed_margin"] += margin
         self.paper["position"] = {"side": side, "entry": price, "qty": qty, "remaining_qty": qty}
-        self._live_manager = "mgr-" + symbol
+        self._live_manager = _TestUnifiedManager(self)
         return True
 
     def log_execution(self, *a, **k):

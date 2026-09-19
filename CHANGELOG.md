@@ -116,3 +116,54 @@ Live non-crypto execution requires the connected broker/exchange to expose those
 - Hardened PAPER finalization price fallback and dashboard state reads.
 - Added unified trade-authority regression coverage.
 - Added final release validation report covering trade management, ROI/PnL, news reaction, UI telemetry, reconciliation and reference-project extraction.
+
+## 2026-09-16 — BARON intelligence consolidation
+- Added dependency-free `core/forecast_evidence.py` for multi-horizon,
+  multi-path forecast evidence with explicit uncertainty and ATR normalization.
+- Wired forecast evidence into queue re-evaluation, execution context and
+  candidate observability without granting it execution authority.
+- Added Kronos/Vibe integration documentation and preserved the single-decision
+  authority model.
+- Added deterministic forecast evidence tests; targeted regression suite remains
+  green after integration.
+
+## 2026-09-16 — Adaptive Intelligence / Windows Bootstrap Hardening
+- Added deterministic Adaptive Trade Intelligence memory and setup fingerprint learning.
+- Added explosive/strong/weak trade outcome classification and conservative historical playbook extraction.
+- Added read-only `/ai-learning` dashboard API and modern AI Trade Coach panel.
+- Captured entry-time EMA50/EMA200, VWAP, ADX/DI, RSI, MACD and ATR features for outcome learning without look-ahead.
+- Added Windows dependency bootstrap recovery with clean pip-cache retry and per-package fallback.
+- Preserved execution authority, portfolio capacity, TP1/TP2 contract, RF, Smart Money, and Unified Trade Management authority.
+
+## 2026-09-18 — Professional Market-State Continuation
+- Added pure `core/market_regime_engine.py` with EMA50/EMA200, session VWAP, accumulation/distribution, structure/liquidity/VPA and observable microstructure evidence.
+- Integrated market-state evidence into institutional entry assessments; EMA crossover remains transition evidence rather than a standalone trigger.
+- Added per-position market-state context to EMA/VWAP management and preserved EMA/VWAP-only HOLD behavior.
+- Added explicit requested-vs-executed quantity and exchange-zero-position fields to reconciliation.
+- Corrected native conditional protection parameter generation so unsupported `clientOrderId` is not sent to BingX conditional protection orders.
+- Added backend-driven Market State dashboard panel.
+- Validation remains BLOCKED for full release because the combined suite is incomplete in this execution environment and live dashboard dependencies are unavailable.
+
+## 2026-09-18 — Professional timing + single management authority hardening
+- Enforced an early-transition entry contract for automated technical entries: EMA50/EMA200 crossing onset or the first few closed candles after the cross, with an EMA50 ATR-distance anti-chase bound.
+- Added `PRE_CROSS_BULLISH/BEARISH`, `POST_CROSS_EARLY`, `POST_CROSS_DEVELOPING`, and `MATURE` crossing-phase evidence to the canonical Market Regime Engine.
+- Unified live management decisions through `UnifiedTradeManagementBrain.evaluate()`; legacy PPE, profit-engine, dynamic-management and stale state-machine branches are compatibility-only and no longer execute runtime management orders.
+- Canonical Market State now drives the live management state label, preventing stale `RANGE_CHOP` from surviving while the canonical regime is expanding/markup/pullback.
+- Removed direct thesis-failure/profit-lock execution from pre-Brain branches; those signals are evidence only and are converted to one action by the Brain.
+- Tightened thesis-failure exits to require a strong negative failure signature or EMA200 + structural failure, avoiding zero-ROE false closes caused by generic distribution labels.
+- Reset per-trade protection/management fields on every new entry to prevent confirmed-SL leakage across portfolio symbols.
+- Preserved TP1/TP2 execution at 50%/50%, exchange verification, native protection, reconciliation, portfolio capacity and News-slot separation.
+
+## 2026-09-18 — Zone Lifecycle Contract Hotfix
+- FIX: `check_institutional_entry()` maturity hard-reject path now preserves the canonical `(bool, classification, reason)` return contract used by all queue/scanner callers.
+- FIX: prevents `TypeError: cannot unpack non-iterable bool object` during `ExecutionQueue.re_evaluate_all()` on mature/exhausted synthetic or live candidate frames.
+- TEST: added a regression test for the maturity rejection return shape and verified all return paths in the function are three-item tuples.
+- PRESERVED: early-transition entry timing, Market Regime authority, Unified Trade Management Brain authority, TP1/TP2 50/50, RF, portfolio capacity and BingX execution/reconciliation architecture.
+
+## 2026-09-19 — Decision Path Telemetry (read-only)
+- Added `core/decision_path_telemetry.py` for persistent forensic decision-path events.
+- Added separate BUY/SELL scanner hypothesis events and selected-direction events.
+- Added queue admission/re-evaluation/state telemetry and Trend v29 gate telemetry.
+- Captures EMA50/EMA200, VWAP, ADX, DI+/DI-, and EQH/EQL liquidity evidence at decision time.
+- Added `tools/decision_path_trace.py` to filter traces by symbol.
+- Added telemetry tests. No strategy thresholds, scores, gates, portfolio rules, SL/TP, RF, or execution behaviour were changed.
