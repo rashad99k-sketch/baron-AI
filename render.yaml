@@ -6,7 +6,7 @@ services:
     name: baron
     runtime: python
     plan: starter
-    buildCommand: pip install -r requirements-runtime.txt
+    buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     healthCheckPath: /health
     autoDeploy: true

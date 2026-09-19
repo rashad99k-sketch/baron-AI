@@ -1,0 +1,12 @@
+# Railway (Nixpacks) build/deploy configuration — build + start ONLY.
+# No application/trading logic.
+#
+# Pins the install command to the repository's authoritative dependency file
+# and the start command to the deterministic production entrypoint.
+providers = ['python']
+
+[phases.install]
+cmds = ['pip install -r requirements.txt']
+
+[start]
+cmd = 'python main.py'
