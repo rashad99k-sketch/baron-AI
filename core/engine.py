@@ -15374,7 +15374,7 @@ class ExecutionCandidate:
     expansion_detected_time: float = 0.0
     confirmation_logged: bool = False
     expansion_logged: bool = False
-    asset_class: str = "CRYPTO"
+    asset_class: str = "UNKNOWN"
     ob_cfg: dict = field(default_factory=dict)
     # ===== ATOM INTELLIGENCE LAYER (Roro Entry -> Atom Approval) =====
     trade_type: str = TRADE_TREND

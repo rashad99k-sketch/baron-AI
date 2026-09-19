@@ -1253,6 +1253,11 @@ def promote_to_queue():
             zone_touches=ztouch, zone_created_at=time.time() if zl and zh else 0.0,
             zone_state="ACTIVE", ob_cfg=qcfg
         )
+        # CLASSIFICATION COHERENCE: carry the watch entry's asset_class onto the
+        # queue candidate. The legacy default "UNKNOWN" (fail-closed) must not
+        # silently mislabel STOCK/INDEX/METAL/OIL as CRYPTO in telemetry while
+        # the portfolio layer routes them to the correct combined bucket.
+        candidate.asset_class = str((entry.get("asset_class") or "")).upper() or "UNKNOWN"
         candidate.state = ExecutionState.DISCOVERED
         candidate.priority_score = metrics.final_zone_score
         candidate.is_a_grade = is_a_grade
