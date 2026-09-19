@@ -1,2 +1,8 @@
--r requirements-runtime.txt
--r requirements-dev.txt
+ccxt
+pandas
+numpy
+Flask
+requests
+python-dotenv
+
+websocket-client>=1.8,<2
