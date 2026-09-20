@@ -382,6 +382,24 @@ class PortfolioManager:
                         "SUCCESS",
                     )
                 return True
+            # execute_entry failed - capture the blocker from engine STATE
+            # so the lifecycle/runtimetelemetry preserves the actual rejection reason
+            if self.engine is not None:
+                try:
+                    _st = self.engine.STATE if isinstance(self.engine.STATE, dict) else {}
+                    _exec_blocker = _st.get("last_exec_blocker")
+                    _open_outcome = _st.get("last_open_outcome")
+                    _blocker = None
+                    if isinstance(_exec_blocker, dict):
+                        _blocker = _exec_blocker.get("blocker")
+                    if not _blocker and isinstance(_open_outcome, str) and _open_outcome.startswith("OPEN_REJECTED:"):
+                        _blocker = _open_outcome.split(":", 1)[1].strip()
+                    if _blocker:
+                        _lc = self.engine.MEMORY.setdefault("opportunity_lifecycle", {}).setdefault(symbol, {})
+                        _lc["primary_blocker"] = _blocker
+                        _lc["execution_blocker"] = _exec_blocker
+                except Exception:
+                    pass
             self.trade_registry.update(trade_id, status="REJECTED", closed_at=time.time())
             return False
         finally:
