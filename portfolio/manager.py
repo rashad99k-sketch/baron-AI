@@ -293,11 +293,70 @@ class PortfolioManager:
 
     def open_candidate(self, candidate: dict) -> bool:
         symbol = candidate["symbol"]
+        trade_id = candidate.get("trade_id") or TradeLifecycleJournal.new_trade_id(symbol)
+        candidate["trade_id"] = trade_id
+        trade_id = str(trade_id)
+        client_order_id = TradeRegistry.client_order_id(trade_id, "OPEN", "MAIN")
+        
+        # FORENSIC: Track rejection path
+        _forensic = {
+            "symbol": symbol,
+            "trade_id": trade_id,
+            "asset_class": candidate.get("asset_class", ""),
+            "bucket": "",
+            "normalized_bucket": "",
+            "stage": "OPEN_CANDIDATE_START",
+            "accepted": False,
+            "rejection_category": "",
+            "rejection_reason": "",
+            "rejection_reason_user": "",
+            "blocker": "",
+            "portfolio_capacity_result": "",
+            "allocator_result": "",
+            "allocator_reason": "",
+            "risk_result": "",
+            "risk_reason": "",
+            "entry_guard_result": "",
+            "entry_guard_reason": "",
+            "execution_result": "",
+            "execution_reason": "",
+            "next_queue_action": "",
+        }
+        try:
+            from portfolio.allocator import bucket_of
+            ac = self._asset_class(symbol, candidate.get("asset_class"))
+            _forensic["asset_class"] = ac
+            _forensic["bucket"] = bucket_of(ac)
+            _forensic["normalized_bucket"] = bucket_of(ac)
+        except Exception:
+            pass
+        
         if not candidate.get("trade_id"):
             candidate["trade_id"] = TradeLifecycleJournal.new_trade_id(symbol)
         trade_id = str(candidate["trade_id"])
         client_order_id = TradeRegistry.client_order_id(trade_id, "OPEN", "MAIN")
         if not self.can_open(symbol, candidate.get("asset_class")):
+            # FORENSIC: can_open failed - get specific blocker
+            blocker = self._can_open_blocker(symbol, candidate.get("asset_class"))
+            _forensic.update({
+                "stage": "PORTFOLIO_CAN_OPEN",
+                "accepted": False,
+                "rejection_category": "capacity" if "CAPACITY" in blocker or "FULL" in blocker else "unknown",
+                "rejection_reason": blocker,
+                "rejection_reason_user": blocker,
+                "blocker": blocker,
+                "portfolio_capacity_result": blocker,
+                "next_queue_action": "retry_next_cycle" if "CAPACITY" in blocker or "FULL" in blocker else "retry_next_cycle",
+            })
+            self._log_forensic_rejection(_forensic)
+            if self.engine is not None:
+                try:
+                    if blocker:
+                        _lc = self.engine.MEMORY.setdefault("opportunity_lifecycle", {}).setdefault(symbol, {})
+                        _lc["primary_blocker"] = blocker
+                except Exception:
+                    pass
+            return False
             # Do not materialize rejected capacity/risk intents as active trade
             # records. This prevents restart recovery from mistaking a rejected
             # candidate for a live position.
@@ -384,6 +443,40 @@ class PortfolioManager:
                 return True
             # execute_entry failed - capture the blocker from engine STATE
             # so the lifecycle/runtimetelemetry preserves the actual rejection reason
+            _forensic_execution = {
+                "symbol": symbol,
+                "trade_id": trade_id,
+                "asset_class": candidate.get("asset_class", ""),
+                "raw_asset_class": candidate.get("asset_class", ""),
+                "bucket": "",
+                "normalized_bucket": "",
+                "stage": "EXECUTE_ENTRY",
+                "accepted": False,
+                "rejection_category": "",
+                "rejection_reason": "",
+                "rejection_reason_user": "",
+                "blocker": "",
+                "portfolio_capacity_result": "",
+                "allocator_result": "",
+                "allocator_reason": "",
+                "risk_result": "",
+                "risk_reason": "",
+                "entry_guard_result": "",
+                "entry_guard_reason": "",
+                "execution_result": "REJECTED",
+                "execution_reason": "",
+                "next_queue_action": "retry_next_cycle",
+                "lifecycle_state": "EXECUTION_REJECTED",
+            }
+            try:
+                from portfolio.allocator import bucket_of
+                ac = self._asset_class(symbol, candidate.get("asset_class"))
+                _forensic_execution["asset_class"] = ac
+                _forensic_execution["raw_asset_class"] = candidate.get("asset_class", "")
+                _forensic_execution["bucket"] = bucket_of(ac)
+                _forensic_execution["normalized_bucket"] = bucket_of(ac)
+            except Exception:
+                pass
             if self.engine is not None:
                 try:
                     _st = self.engine.STATE if isinstance(self.engine.STATE, dict) else {}
@@ -392,18 +485,90 @@ class PortfolioManager:
                     _blocker = None
                     if isinstance(_exec_blocker, dict):
                         _blocker = _exec_blocker.get("blocker")
+                        _forensic_execution["execution_reason"] = _exec_blocker.get("reason", "")
+                        _forensic_execution["rejection_reason"] = _exec_blocker.get("blocker", "")
+                        _forensic_execution["rejection_category"] = _exec_blocker.get("blocker", "")
+                        _forensic_execution["blocker"] = _exec_blocker.get("blocker", "")
                     if not _blocker and isinstance(_open_outcome, str) and _open_outcome.startswith("OPEN_REJECTED:"):
                         _blocker = _open_outcome.split(":", 1)[1].strip()
+                        _forensic_execution["rejection_reason"] = _blocker
+                        _forensic_execution["rejection_category"] = _blocker
+                        _forensic_execution["blocker"] = _blocker
                     if _blocker:
                         _lc = self.engine.MEMORY.setdefault("opportunity_lifecycle", {}).setdefault(symbol, {})
                         _lc["primary_blocker"] = _blocker
                         _lc["execution_blocker"] = _exec_blocker
+                    # Determine rejection category from blocker
+                    if _blocker:
+                        if "CAPACITY" in _blocker or "FULL" in _blocker:
+                            _forensic_execution["rejection_category"] = "capacity"
+                        elif "BARON" in _blocker:
+                            _forensic_execution["rejection_category"] = "baron_judge"
+                        elif "LIQUIDITY" in _blocker:
+                            _forensic_execution["rejection_category"] = "liquidity"
+                        elif "ADX" in _blocker:
+                            _forensic_execution["rejection_category"] = "adx"
+                        elif "SESSION" in _blocker:
+                            _forensic_execution["rejection_category"] = "session"
+                        elif "ENTRY_QUALITY" in _blocker:
+                            _forensic_execution["rejection_category"] = "entry_quality"
+                        elif "RISK" in _blocker:
+                            _forensic_execution["rejection_category"] = "risk"
+                        elif "DATA" in _blocker:
+                            _forensic_execution["rejection_category"] = "data"
+                        elif "NEWS" in _blocker:
+                            _forensic_execution["rejection_category"] = "news"
+                        else:
+                            _forensic_execution["rejection_category"] = "execution"
+                        _forensic_execution["next_queue_action"] = "retry_next_cycle"
+                    else:
+                        _forensic_execution["rejection_category"] = "unknown"
+                        _forensic_execution["rejection_reason"] = "UNKNOWN"
+                        _forensic_execution["next_queue_action"] = "retry_next_cycle"
+                    # Log forensic record
+                    self._log_forensic_rejection(_forensic_execution)
                 except Exception:
                     pass
             self.trade_registry.update(trade_id, status="REJECTED", closed_at=time.time())
             return False
         finally:
             self.deactivate()
+
+    def _log_forensic_rejection(self, forensic: dict) -> None:
+        """Log a structured forensic record for every open_candidate rejection."""
+        if not self.engine:
+            return
+        try:
+            self.engine.log_execution(
+                f"[OPEN_REJECTION_FORENSIC] "
+                f"symbol={forensic.get('symbol','')} "
+                f"trade_id={forensic.get('trade_id','')} "
+                f"stage={forensic.get('stage','')} "
+                f"accepted={forensic.get('accepted','')} "
+                f"rejection_category={forensic.get('rejection_category','')} "
+                f"rejection_reason={forensic.get('rejection_reason','')} "
+                f"rejection_reason_user={forensic.get('rejection_reason_user','')} "
+                f"blocker={forensic.get('blocker','')} "
+                f"bucket={forensic.get('bucket','')} "
+                f"asset_class={forensic.get('asset_class','')} "
+                f"raw_asset_class={forensic.get('raw_asset_class','')} "
+                f"portfolio_capacity_result={forensic.get('portfolio_capacity_result','')} "
+                f"allocator_result={forensic.get('allocator_result','')} "
+                f"allocator_reason={forensic.get('allocator_reason','')} "
+                f"risk_result={forensic.get('risk_result','')} "
+                f"risk_reason={forensic.get('risk_reason','')} "
+                f"entry_guard_result={forensic.get('entry_guard_result','')} "
+                f"entry_guard_reason={forensic.get('entry_guard_reason','')} "
+                f"execution_result={forensic.get('execution_result','')} "
+                f"execution_reason={forensic.get('execution_reason','')} "
+                f"next_queue_action={forensic.get('next_queue_action','')} "
+                f"lifecycle_state={forensic.get('lifecycle_state','')}",
+                "WARN",
+                debounce_key=f"forensic_reject_{forensic.get('symbol','')}",
+                debounce_sec=10,
+            )
+        except Exception:
+            pass
 
     def _log_news_open(self, symbol: str, candidate: dict) -> None:
         """Emit the dedicated, unambiguous NEWS open block so the runtime log
