@@ -743,7 +743,16 @@ def _execute_ready_queue_candidate():
             )
             return True
         _exec_gate("open_candidate_failed")
-        _classify_open_failure(best.symbol, best.side, exec_pipe)
+        # Capture the authoritative portfolio blocker before it can be overwritten.
+        # This mirrors the allocator-reject branch which passes explicit_token/blocker.
+        _portfolio_blocker = ""
+        try:
+            _portfolio_blocker = PORTFOLIO._can_open_blocker(best.symbol, _asset_cls)
+        except Exception:
+            pass
+        _classify_open_failure(best.symbol, best.side, exec_pipe,
+                               explicit_token=_portfolio_blocker,
+                               explicit_blocker=_portfolio_blocker)
         # QUEUE ADVANCE for open_candidate_failed capacity rejections. A
         # deterministic capacity blocker (FOREX_CAPACITY_FULL, TOTAL,
         # TECHNICAL, NEWS_SLOT, <bucket>_CAPACITY_FULL) must NOT re-pick the
