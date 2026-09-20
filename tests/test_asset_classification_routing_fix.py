@@ -449,6 +449,105 @@ class AssetClassificationRoutingFixTest(unittest.TestCase):
         self.assertEqual(exec_pipe.get("last_reject_asset_class"), "STOCK")
         self.assertEqual(exec_pipe.get("last_reject_bucket"), "INDEX_STOCK")
 
+    def test_open_candidate_rejection_reason_propagated_not_unknown(self):
+        """open_candidate failures must propagate the actual blocker reason,
+        not fall back to UNKNOWN/unknown.
+        
+        This tests the fix for: open_candidate_failed events with
+        rejection_category=unknown, rejection_reason=UNKNOWN despite
+        having correct asset_class and bucket.
+        """
+        RT = self.RT
+        E = RT.E
+
+        # Fill INDEX_STOCK bucket (2 seats)
+        for sym in ["US500/USDT:USDT", "USTECH/USDT:USDT"]:
+            self._ready_candidate(sym, score=80.0)
+            self.assertTrue(RT._execute_ready_queue_candidate())
+
+        # Try to add STOCK #3 - should fail with INDEX_STOCK_CAPACITY_FULL
+        self._ready_candidate("NCSKAAPL2USD/USDT:USDT", score=80.0)
+        self.assertFalse(RT._execute_ready_queue_candidate(),
+                         "STOCK #3 must be rejected as INDEX_STOCK_CAP")
+
+        exec_pipe = self._exec_pipe()
+        # The rejection category must be 'capacity', not 'unknown'
+        self.assertEqual(exec_pipe.get("last_open_failure_category"), "capacity",
+                         "rejection_category must be capacity, not unknown")
+        # The blocker must be the specific capacity full reason
+        self.assertEqual(exec_pipe.get("last_open_failure_blocker"), "INDEX_STOCK_CAPACITY_FULL",
+                         "rejection_reason must be INDEX_STOCK_CAPACITY_FULL, not UNKNOWN")
+        # The open_attempt telemetry must also reflect this
+        last_attempt = exec_pipe.get("last_open_attempt")
+        self.assertIsNotNone(last_attempt)
+        self.assertEqual(last_attempt["rejection_category"], "capacity")
+        self.assertEqual(last_attempt["rejection_reason"], "INDEX_STOCK_CAP")
+        self.assertNotEqual(last_attempt["rejection_category"], "unknown")
+        self.assertNotEqual(last_attempt["rejection_reason"], "UNKNOWN")
+
+    def test_open_candidate_crypto_rejection_propagated(self):
+        """CRYPTO bucket full rejection must propagate CRYPTO_SLOT_FULL, not UNKNOWN."""
+        RT = self.RT
+        E = RT.E
+
+        # Fill CRYPTO bucket (2 seats)
+        for sym in ["BTC/USDT:USDT", "ETH/USDT:USDT"]:
+            self._ready_candidate(sym, score=80.0)
+            self.assertTrue(RT._execute_ready_queue_candidate())
+
+        # Try to add CRYPTO #3 - should fail with CRYPTO_SLOT_FULL
+        self._ready_candidate("SOL/USDT:USDT", score=80.0)
+        self.assertFalse(RT._execute_ready_queue_candidate(),
+                         "CRYPTO #3 must be rejected as CRYPTO_CAP")
+
+        exec_pipe = self._exec_pipe()
+        self.assertEqual(exec_pipe.get("last_open_failure_category"), "capacity",
+                         "CRYPTO rejection must be capacity category")
+        self.assertEqual(exec_pipe.get("last_open_failure_blocker"), "CRYPTO_SLOT_FULL",
+                         "CRYPTO rejection must be CRYPTO_SLOT_FULL, not UNKNOWN")
+        last_attempt = exec_pipe.get("last_open_attempt")
+        self.assertIsNotNone(last_attempt)
+        self.assertEqual(last_attempt["rejection_category"], "capacity")
+        self.assertEqual(last_attempt["rejection_reason"], "CRYPTO_CAP")
+        self.assertEqual(last_attempt["asset_class"], "CRYPTO")
+        self.assertEqual(last_attempt["bucket"], "CRYPTO")
+        self.assertEqual(last_attempt["normalized_bucket"], "CRYPTO")
+
+    def test_open_candidate_technical_cap_rejection_propagated(self):
+        """When technical=5/5, a new candidate is rejected at allocator with
+        the specific bucket cap (e.g., CRYPTO_CAP) not TECHNICAL_CAP.
+        The allocator checks bucket caps first. This test verifies the
+        rejection reason is propagated correctly (not UNKNOWN)."""
+        RT = self.RT
+        E = RT.E
+
+        # Fill all 5 technical slots: 2 CRYPTO + 2 INDEX_STOCK + 1 COMMODITY
+        for sym in ["BTC/USDT:USDT", "ETH/USDT:USDT",  # CRYPTO x2
+                    "US500/USDT:USDT", "USTECH/USDT:USDT",  # INDEX_STOCK x2
+                    "XAUUSD"]:  # COMMODITY x1
+            self._ready_candidate(sym, score=80.0)
+            self.assertTrue(RT._execute_ready_queue_candidate(), f"open {sym}")
+
+        # Now technical = 5/5, try to add another CRYPTO candidate
+        # The allocator will reject with CRYPTO_CAP (bucket cap) first
+        self._ready_candidate("SOL/USDT:USDT", score=80.0)
+        self.assertFalse(RT._execute_ready_queue_candidate(),
+                         "Technical #6 must be rejected (CRYPTO_CAP at allocator)")
+
+        exec_pipe = self._exec_pipe()
+        # The rejection is at allocator with CRYPTO_CAP, which maps to capacity category
+        self.assertEqual(exec_pipe.get("last_open_failure_category"), "capacity",
+                         "Technical cap rejection must be capacity category (via CRYPTO_CAP)")
+        self.assertEqual(exec_pipe.get("last_open_failure_blocker"), "CRYPTO_SLOT_FULL",
+                         "Rejection must be CRYPTO_SLOT_FULL (allocator bucket cap), not UNKNOWN")
+        last_attempt = exec_pipe.get("last_open_attempt")
+        self.assertIsNotNone(last_attempt)
+        self.assertEqual(last_attempt["rejection_category"], "capacity")
+        self.assertEqual(last_attempt["rejection_reason"], "CRYPTO_CAP")
+        self.assertEqual(last_attempt["asset_class"], "CRYPTO")
+        self.assertEqual(last_attempt["bucket"], "CRYPTO")
+        self.assertEqual(last_attempt["normalized_bucket"], "CRYPTO")
+
     def test_portfolio_capacity_counters_match_allocator(self):
         """Portfolio manager capacity counters must match allocator buckets."""
         RT = self.RT
