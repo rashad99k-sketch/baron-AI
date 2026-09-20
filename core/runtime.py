@@ -10,7 +10,7 @@ import requests
 import core.engine as E
 import scanner.scanner as S
 from portfolio.manager import PortfolioManager
-from portfolio.allocator import GlobalAssetAllocator
+from portfolio.allocator import GlobalAssetAllocator, bucket_of
 from scanner.deep_scanner import DeepScanner
 try:
     from news.reaction import NewsReactionEngine
@@ -412,7 +412,7 @@ def _classify_open_failure(symbol, side: str, exec_pipe: dict,
 
 
 def _record_open_attempt(exec_pipe: dict, *, symbol="", asset_class="", bucket="",
-                         lifecycle_state="READY", portfolio_capacity_result="",
+                         normalized_bucket="", lifecycle_state="READY", portfolio_capacity_result="",
                          rejection_reason="", rejection_category="",
                          next_queue_action="", raw_asset_class="") -> None:
     """Deterministic per-OPEN_REQUESTED-attempt telemetry ring (bounded).
@@ -427,6 +427,10 @@ def _record_open_attempt(exec_pipe: dict, *, symbol="", asset_class="", bucket="
     writes FOREX for NCFX symbols) and `asset_class` is the class the layer
     actually used (allocator decision class / candidate class), so a
     split-brain (raw FOREX vs used CRYPTO) is never silently hidden.
+
+    `normalized_bucket` is the authoritative bucket derived from asset_class
+    via bucket_of(). If bucket was missing/empty, normalized_bucket shows the
+    corrected value for auditability.
     """
     try:
         _attempts = exec_pipe.setdefault("open_attempts", [])
@@ -435,6 +439,7 @@ def _record_open_attempt(exec_pipe: dict, *, symbol="", asset_class="", bucket="
             "asset_class": str(asset_class or ""),
             "raw_asset_class": str(raw_asset_class or ""),
             "bucket": str(bucket or ""),
+            "normalized_bucket": str(normalized_bucket or ""),
             "lifecycle_state": str(lifecycle_state or "READY"),
             "portfolio_capacity_result": str(portfolio_capacity_result or ""),
             "rejection_reason": str(rejection_reason or ""),
@@ -519,6 +524,7 @@ def _execute_ready_queue_candidate():
             symbol="",
             asset_class="",
             bucket="TOTAL",
+            normalized_bucket="TOTAL",
             lifecycle_state="READY",
             portfolio_capacity_result="SLOT_CAP (TOTAL_PORTFOLIO_CAPACITY_FULL)",
             rejection_reason="SLOT_CAP",
@@ -680,6 +686,7 @@ def _execute_ready_queue_candidate():
                         asset_class=decision.asset_class,
                         raw_asset_class=candidate.get("asset_class", ""),
                         bucket=decision.bucket,
+                        normalized_bucket=decision.bucket,
                         lifecycle_state=getattr(best, "state", None).value if getattr(best, "state", None) is not None else "READY",
                         portfolio_capacity_result=f"{decision.reason} ({_reason_user}) "
                                                   f"bucket={decision.bucket} {decision.bucket_used}/{decision.bucket_max}",
@@ -726,7 +733,8 @@ def _execute_ready_queue_candidate():
                 symbol=best.symbol,
                 asset_class=best.asset_class,
                 raw_asset_class=_cand_ac,
-                bucket="",
+                bucket=decision.bucket,
+                normalized_bucket=decision.bucket,
                 lifecycle_state="EXECUTED",
                 portfolio_capacity_result="ALLOWED (executed)",
                 rejection_reason="",
@@ -759,12 +767,15 @@ def _execute_ready_queue_candidate():
                 pass
         _oa_next = "backoff+advance_queue" if _oa_is_capacity else "retry_next_cycle"
         _watch_ac = watch.get("asset_class") if isinstance(watch, dict) else ""
+        _asset_cls = getattr(best, "asset_class", "") or _cand_ac
+        _norm_bucket = bucket_of(_asset_cls) if _asset_cls else ""
         _record_open_attempt(
             exec_pipe,
             symbol=best.symbol,
-            asset_class=getattr(best, "asset_class", ""),
+            asset_class=_asset_cls,
             raw_asset_class=str(_watch_ac or ""),
-            bucket="",
+            bucket=_norm_bucket,
+            normalized_bucket=_norm_bucket,
             lifecycle_state=getattr(best, "state", None).value if getattr(best, "state", None) is not None else "READY",
             portfolio_capacity_result="PORTFOLIO/open_candidate rejected",
             rejection_reason=exec_pipe.get("last_open_failure_blocker", "UNKNOWN"),

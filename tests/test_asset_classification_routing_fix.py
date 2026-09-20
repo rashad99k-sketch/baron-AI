@@ -472,6 +472,90 @@ class AssetClassificationRoutingFixTest(unittest.TestCase):
         self.assertTrue(RT.execute_news_slot())
         self.assertEqual(RT.PORTFOLIO.count(), 6)
 
+    def test_bucket_propagation_in_telemetry_normalized_bucket(self):
+        """Telemetry must include normalized_bucket derived from asset_class."""
+        RT = self.RT
+        E = RT.E
+
+        # Test successful execution - should have normalized_bucket = bucket
+        self._ready_candidate("NCSKAAPL2USD/USDT:USDT", score=80.0)
+        self.assertTrue(RT._execute_ready_queue_candidate())
+
+        exec_pipe = self._exec_pipe()
+        last_attempt = exec_pipe.get("last_open_attempt")
+        self.assertIsNotNone(last_attempt)
+        self.assertEqual(last_attempt["symbol"], "NCSKAAPL2USD/USDT:USDT")
+        self.assertEqual(last_attempt["asset_class"], "STOCK")
+        self.assertEqual(last_attempt["normalized_bucket"], "INDEX_STOCK")
+        self.assertEqual(last_attempt["bucket"], "INDEX_STOCK")
+
+    def test_bucket_propagation_on_failure_derives_from_asset_class(self):
+        """When open_candidate fails, normalized_bucket must be derived from asset_class."""
+        RT = self.RT
+        E = RT.E
+
+        # Fill INDEX_STOCK bucket first
+        for sym in ["US500/USDT:USDT", "USTECH/USDT:USDT"]:
+            self._ready_candidate(sym, score=80.0)
+            self.assertTrue(RT._execute_ready_queue_candidate())
+
+        # Now try to add another STOCK - should fail with INDEX_STOCK_CAP
+        self._ready_candidate("NCSKAAPL2USD/USDT:USDT", score=80.0)
+        self.assertFalse(RT._execute_ready_queue_candidate(),
+                         "STOCK #3 must be rejected as INDEX_STOCK_CAP")
+
+        exec_pipe = self._exec_pipe()
+        last_attempt = exec_pipe.get("last_open_attempt")
+        self.assertIsNotNone(last_attempt)
+        self.assertEqual(last_attempt["symbol"], "NCSKAAPL2USD/USDT:USDT")
+        self.assertEqual(last_attempt["asset_class"], "STOCK")
+        self.assertEqual(last_attempt["normalized_bucket"], "INDEX_STOCK")
+        self.assertEqual(last_attempt["bucket"], "INDEX_STOCK")
+        self.assertEqual(last_attempt["rejection_category"], "capacity")
+        self.assertEqual(last_attempt["rejection_reason"], "INDEX_STOCK_CAP")
+
+    def test_all_asset_classes_have_correct_normalized_bucket_in_telemetry(self):
+        """Verify each asset class gets correct normalized_bucket in telemetry.
+        
+        This test focuses on allocator decision telemetry, not execution success.
+        Some symbols may be rejected by the judge - we verify the allocator
+        decision telemetry which is where bucket propagation matters.
+        """
+        RT = self.RT
+        E = RT.E
+        from portfolio.allocator import bucket_of
+
+        test_cases = [
+            ("BTC/USDT:USDT", "CRYPTO", "CRYPTO"),
+            ("ETH/USDT:USDT", "CRYPTO", "CRYPTO"),
+            ("US500/USDT:USDT", "INDEX", "INDEX_STOCK"),
+            ("USTECH/USDT:USDT", "INDEX", "INDEX_STOCK"),
+            ("NCSKAAPL2USD/USDT:USDT", "STOCK", "INDEX_STOCK"),
+            ("XAUUSD", "GOLD", "COMMODITY"),
+            ("OIL/USDT:USDT", "OIL", "COMMODITY"),
+            ("XAGUSD", "METAL", "COMMODITY"),
+        ]
+
+        for sym, cls, expected_bucket in test_cases:
+            with self.subTest(symbol=sym, asset_class=cls):
+                self._ready_candidate(sym, score=80.0)
+                queue_snapshot = [c.to_dict() for c in E.queue._candidates.values()
+                                  if c.state != E.ExecutionState.EXECUTED]
+                alloc_report = RT.ALLOCATOR.allocate(queue_snapshot, limit=6)
+                
+                decisions = {d.symbol: d for d in alloc_report.decisions}
+                self.assertIn(sym, decisions, f"{sym}: not in allocator decisions")
+                self.assertEqual(decisions[sym].asset_class, cls,
+                                 f"{sym}: allocator asset_class={decisions[sym].asset_class}, expected {cls}")
+                self.assertEqual(decisions[sym].bucket, expected_bucket,
+                                 f"{sym}: allocator bucket={decisions[sym].bucket}, expected {expected_bucket}")
+                # Note: allocator decision doesn't have normalized_bucket field,
+                # but bucket is the normalized bucket derived from asset_class
+                self.assertEqual(decisions[sym].bucket, expected_bucket)
+
+                # Clean up for next iteration
+                E.queue._candidates.clear()
+
     def _news_watch(self, symbol="NCSKNVDA2USD/USDT:USDT", bias="BULLISH",
                     risk=20.0):
         E = self.RT.E
