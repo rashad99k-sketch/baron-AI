@@ -10,17 +10,13 @@ import hmac
 from flask import Flask, jsonify, request
 import core.engine as E
 import scanner.scanner as S
+
+try:
+    from portfolio.manager import canonical_position_payload as _canonical_pos_payload
+except Exception:
+    _canonical_pos_payload = None
 globals().update({k:v for k,v in vars(E).items() if not k.startswith('__')})
 globals().update({k:v for k,v in vars(S).items() if not k.startswith('__')})
-# Re-pin the dependency names AFTER copying engine/scanner globals. core.engine
-# imports Flask at its own import time and caches the class in its globals; the
-# globals().update(vars(E)) above would otherwise copy a STALE Flask class (e.g.
-# one captured under a test-only boundary that lacks test_client) and the `app`
-# below would be built from it. Always bind to the flask module that is actually
-# registered NOW so the dashboard app has the full API surface deterministically.
-Flask = getattr(__import__("flask"), "Flask")
-jsonify = getattr(__import__("flask"), "jsonify")
-request = getattr(__import__("flask"), "request")
 
 
 def _sync_engine_state():
@@ -31,7 +27,7 @@ def _sync_engine_state():
     from a stale import-time snapshot.
     """
     eng = _sys.modules.get("core.engine")
-    if eng is None or eng is E:
+    if eng is None:
         return
     for name in ("MEMORY", "CACHE", "STATE", "DASHBOARD_STATE", "queue"):
         if hasattr(eng, name):
@@ -327,15 +323,6 @@ def dashboard():
         <div class="card">Continuation Pressure<div id="cont_pressure">-</div></div>
         <div class="card">Thesis Failure Score<div id="thesis_failure">-</div></div>
       </div>
-      <div class="grid" style="grid-template-columns: repeat(6,1fr); margin-top:8px;">
-        <div class="card">MARKET STATE<div id="ms-state">-</div></div>
-        <div class="card">EMA50 / EMA200<div id="ms-ema">-</div></div>
-        <div class="card">VWAP VALUE<div id="ms-vwap">-</div></div>
-        <div class="card">ACCUMULATION<div id="ms-acc">-</div></div>
-        <div class="card">DISTRIBUTION<div id="ms-dist">-</div></div>
-        <div class="card">MICROSTRUCTURE<div id="ms-micro">-</div></div>
-      </div>
-      <div id="ms-reasons" class="card" style="margin-top:8px;font-size:12px;">Market-state evidence: -</div>
     </div>
     """
     
@@ -490,38 +477,6 @@ def dashboard():
     """
     
     supervisor_panel_html = render_live_supervisor_panel()
-
-    ai_learning_panel_html = """
-    <div class="section ai-learning-panel">
-      <div class="ai-head">
-        <div>
-          <div class="ai-kicker">BARON ADAPTIVE INTELLIGENCE</div>
-          <div class="title ai-title">🧠 AI Trade Coach — Learn From Winners, Diagnose Weak Entries</div>
-          <div class="ai-subtitle">Outcome memory + setup fingerprint learning. Advisory only — it never changes live rules by itself.</div>
-        </div>
-        <div id="ai-status" class="ai-badge">LEARNING</div>
-      </div>
-      <div class="ai-grid">
-        <div class="ai-card"><div class="ai-label">Recorded Trades</div><div id="ai-total" class="ai-value">0</div></div>
-        <div class="ai-card"><div class="ai-label">Strong / Explosive</div><div id="ai-strong" class="ai-value">0</div></div>
-        <div class="ai-card"><div class="ai-label">Explosive Rate</div><div id="ai-explosive" class="ai-value">0%</div></div>
-        <div class="ai-card"><div class="ai-label">Avg Peak ROE</div><div id="ai-peak" class="ai-value">0%</div></div>
-        <div class="ai-card"><div class="ai-label">Avg Realized</div><div id="ai-realized" class="ai-value">0%</div></div>
-      </div>
-      <div class="ai-columns">
-        <div class="ai-box"><div class="ai-box-title">LIVE SETUP DIAGNOSIS</div><div id="ai-live-diagnosis" class="ai-diagnosis">No open setup.</div></div>
-        <div class="ai-box"><div class="ai-box-title">LEARNED EXPLOSIVE PATTERNS</div><div id="ai-playbook" class="ai-list">Building the playbook…</div></div>
-      </div>
-      <div class="ai-box"><div class="ai-box-title">RECENT TRADE LESSONS</div><div id="ai-recent" class="ai-list">Loading…</div></div>
-    </div>
-    <style>
-      .ai-learning-panel{background:linear-gradient(145deg,#0b1220,#090d15);border:1px solid #263449;border-radius:16px;margin:14px;padding:16px;box-shadow:0 12px 30px rgba(0,0,0,.22)}
-      .ai-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;border-bottom:1px solid #243044;padding-bottom:12px}.ai-kicker{font-size:10px;letter-spacing:1.8px;color:#7dd3fc;font-weight:800}.ai-title{font-size:18px!important;color:#e5f7ff!important;margin-top:4px}.ai-subtitle{font-size:11px;color:#8fa0b5;margin-top:4px}.ai-badge{padding:7px 12px;border-radius:999px;border:1px solid #2563eb;background:#0b1c3d;color:#93c5fd;font-size:11px;font-weight:800;white-space:nowrap}
-      .ai-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:9px;margin:13px 0}.ai-card{background:#111a28;border:1px solid #1f2b3d;border-radius:12px;padding:10px}.ai-label{font-size:10px;color:#8494a8;text-transform:uppercase}.ai-value{font-size:19px;font-weight:800;color:#e8f2ff;margin-top:4px}
-      .ai-columns{display:grid;grid-template-columns:1fr 1.4fr;gap:10px;margin-bottom:10px}.ai-box{background:#0e1623;border:1px solid #1d2a3b;border-radius:12px;padding:11px}.ai-box-title{font-size:10px;letter-spacing:1px;color:#7f91a7;font-weight:800;margin-bottom:8px}.ai-diagnosis{font-size:12px;line-height:1.65;color:#d7e1ed}.ai-list{max-height:230px;overflow:auto;font-size:11px;color:#cbd5e1}.ai-row{padding:8px 0;border-bottom:1px solid #1b2635}.ai-row:last-child{border-bottom:0}.ai-tag{display:inline-block;border:1px solid #334155;border-radius:999px;padding:2px 7px;margin-right:5px;font-size:9px}.ai-strong{color:#86efac}.ai-weak{color:#fca5a5}.ai-neutral{color:#fcd34d}
-      @media(max-width:900px){.ai-grid{grid-template-columns:repeat(2,1fr)}.ai-columns{grid-template-columns:1fr}}
-    </style>
-    """
     
     html = f"""
 <!DOCTYPE html>
@@ -549,7 +504,9 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 </style>
 </head>
 <body>
-<div class="header">🔥 RF Liquidity Pro — v28 Fixed Live Supervisor</div>
+<div class="header">🔥 RF Liquidity Pro — BARON Digital Command Center</div>
+<div class="section smart-layer"><div class="title">🤖 AI MARKET INTELLIGENCE — MULTI-AGENT EVIDENCE</div>
+<div class="card" id="aiMarketPanel">Loading AI market intelligence...</div></div>
 {decision_panel_html}
 {scanner_v2_section}
 {pipeline_panel_html}
@@ -559,7 +516,6 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 {intent_panel_html}
 {dynamic_trade_panel_html}
 {flow_section_html}
-{ai_learning_panel_html}
 {continuation_panel_html}
 {thesis_panel_html}
 {confidence_regime_panel}
@@ -588,13 +544,9 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 </div>
 <div class="section smart-layer"><div class="title">📰 NEWS / EVENT RISK</div>
 <div id="newsPanel" class="card">No news assessment yet</div>
-<div id="newsReactionPanel" class="card" style="margin-top:10px">No confirmed market reactions yet</div>
 </div>
 <div class="section smart-layer"><div class="title">🛰️ DEEP INSTITUTIONAL RADAR</div>
 <div id="deepRadar" class="card">No radar data</div>
-</div>
-<div class="section smart-layer"><div class="title">🏦 INSTITUTIONAL SETUP RADAR</div>
-<div id="institutionalSetupRadar" class="card">Loading institutional evidence...</div>
 </div>
 <div class="section smart-layer"><div class="title">📡 TOP RF OPPORTUNITIES</div>
 <div id="top5" class="card"></div>
@@ -636,7 +588,6 @@ async function fetchData() {{
     try {{
         const r = await fetch('/data');
         const d = await r.json();
-        window.__baronData = d;
         cachedData = d;
         updateUI(d);
     }} catch(e) {{ console.error(e); }}
@@ -676,16 +627,6 @@ function updateUI(d) {{
           }}).join("")
         : "No news assessment yet";
 
-    const reactions = (d.news_reaction && d.news_reaction.items) || [];
-    document.getElementById("newsReactionPanel").innerHTML = reactions.length
-        ? reactions.map(r => {{
-            const rr = r.reaction || {{}};
-            const ok = String(rr.causality || "").toUpperCase() === "CONFIRMED";
-            const rc = ok ? "#00ffa6" : "#f1c40f";
-            return `<div style="padding:7px 0;border-bottom:1px solid #1f2937"><b>${{r.symbol || "MARKET"}}</b> · <span style="color:${{rc}};font-weight:700">${{rr.causality || "OBSERVED"}}</span> · ${{rr.direction || "FLAT"}} · move=${{rr.move_pct == null ? "-" : Number(rr.move_pct).toFixed(3)}}%<div style="font-size:11px;color:#9ca3af">${{r.headline || ""}}</div></div>`;
-          }}).join("")
-        : "No confirmed market reactions yet";
-
     const portfolio = d.portfolio || {{open_positions: 0, max_positions: 0, capacity: 0}};
     document.getElementById("portfolioSummary").innerText =
         `${{portfolio.open_positions}} / ${{portfolio.max_positions}} positions | ${{portfolio.capacity}} slots available`;
@@ -712,37 +653,37 @@ function updateUI(d) {{
     document.getElementById("portfolioPositions").innerHTML = positions.length
         ? positions.map(p => {{
             const cls = (p.roe_pct || 0) >= 0 ? "green" : "red";
-            const stage = p.profit_stage || (p.tp1_hit ? "RUNNER" : "PRE_TP1");
-            const stageIcon = stage === "RUNNER" ? "🏃" : (stage === "TP2_COMPLETE" ? "✅" : "🎯");
-            const runnerHealth = Number(p.runner_health || 0);
-            const healthClass = runnerHealth >= 70 ? "green" : (runnerHealth >= 45 ? "yellow" : "red");
-            const pct = Number(p.tp1_hit ? 100 : p.tp1_progress_pct || 0);
-            const tp2pct = Number(p.tp1_hit ? (p.tp2_progress_pct || 0) : 0);
-            const news = p.news_context || {{}};
-            const protect = p.profit_protection ? "🔒 PROTECTED" : "🟡 ACTIVE";
-            return `<div style="padding:10px 0;border-bottom:1px solid #1f2937;">
-                <div><b>${{p.symbol}}</b> | ${{p.side}} | <b>${{stageIcon}} ${{stage}}</b> |
-                ROI <span class="${{cls}}">${{Number(p.roi_pct ?? p.roe_pct ?? 0).toFixed(2)}}%</span> |
-                PnL <span class="${{cls}}">${{Number(p.pnl_usdt || p.pnl || 0).toFixed(2)}} USDT</span></div>
-                <div style="font-size:12px;margin-top:4px">Entry ${{Number(p.entry || 0).toFixed(4)}} · Mark ${{Number(p.mark_price || 0).toFixed(4)}} · Move ${{Number(p.price_move_pct || 0).toFixed(2)}}%</div>
-                <div style="font-size:12px;margin-top:4px">SL ${{Number(p.sl || 0).toFixed(4)}} · TP1 ${{Number(p.tp1 || 0).toFixed(4)}} <b>[50%]</b> · TP2 ${{Number(p.tp2 || 0).toFixed(4)}} <b>[50%]</b></div>
-                <div style="font-size:11px;color:#9ca3af;margin-top:4px">TP1 progress ${{pct.toFixed(0)}}% · TP2 progress ${{tp2pct.toFixed(0)}}% · Remaining ${{Number(p.remaining_pct || 0).toFixed(1)}}%</div>
-                <div style="height:5px;background:#202938;border-radius:4px;margin:4px 0 6px"><div style="height:5px;width:${{Math.max(0,Math.min(100,p.tp1_hit ? tp2pct : pct))}}%;background:#3498db;border-radius:4px"></div></div>
-                <div>Runner <span class="${{healthClass}}">${{p.runner_active ? "ON" : "OFF"}} · health ${{runnerHealth.toFixed(0)}}%</span> · ${{protect}} · Action: <b>${{p.management_action || "WAIT_TP1"}}</b></div>
-                <div style="font-size:11px;color:#9ca3af">Why: ${{p.management_reason || "No management action recorded"}}</div>
-                <div style="font-size:11px;color:#9ca3af">News: ${{news.status || news.causality || news.reaction || "NONE"}} ${{news.move_pct != null ? "· move=" + Number(news.move_pct).toFixed(3) + "%" : ""}}</div>
-                <div style="font-size:11px;color:#9ca3af">Board: ${{(p.trade_board||{{}}).stage || "ENTRY"}} → ${{(p.trade_board||{{}}).verdict || "MONITOR"}} · ${{sessionLabel(p.market_session)}}</div>
+            return `<div style="padding:8px 0;border-bottom:1px solid #1f2937;">
+                <b>${{p.symbol}}</b> | ${{p.side}} |
+                Entry ${{Number(p.entry || 0).toFixed(4)}} |
+                ROE <span class="${{cls}}">${{Number(p.roe_pct || 0).toFixed(2)}}%</span> |
+                SL ${{Number(p.sl || 0).toFixed(4)}} |
+                TP1 ${{Number(p.tp1 || 0).toFixed(4)}} |
+                TP2 ${{Number(p.tp2 || 0).toFixed(4)}} |
+                <b>${{p.trade_style || "SCALP"}}</b> | ${{p.entry_timing || "WAIT_RETEST"}} |
+                ${{p.zone_behaviour || "NEUTRAL"}}
+                <div style="font-size:11px;color:#9ca3af">Board: ${{(p.trade_board||{{}}).stage || "ENTRY"}} → ${{(p.trade_board||{{}}).verdict || "MONITOR"}}</div>
+                <div style="font-size:11px;color:#9ca3af">${{sessionLabel(p.market_session)}}</div>
             </div>`;
         }}).join("")
         : "No active positions";
 
     if(d.position) {{
-        let pnlClass = d.position.pnl >= 0 ? "green" : "red";
+        const pnlUsdt = Number(d.position.pnl || d.position.pnl_usdt || 0);
+        const roeV = Number(d.position.roe != null ? d.position.roe : (d.position.roe_pct || 0));
+        let pnlClass = pnlUsdt >= 0 ? "green" : "red";
+        const rlzUsdt = Number(d.position.realized_pnl_usdt || 0);
+        const rlzCls = rlzUsdt >= 0 ? "green" : "red";
+        const stage = d.position.profit_stage || "OPENED";
+        const prot = d.position.protection_state || "NONE";
         document.getElementById("pos").innerHTML = `
             <div><b>${{d.position.symbol}}</b> | ${{d.position.side}} | ${{d.position.entry_type}} (${{d.position.classification}})</div>
-            <div>Entry: ${{d.position.entry}} | PnL: <span class="${{pnlClass}}">${{d.position.pnl}}%</span></div>
+            <div>Entry: ${{d.position.entry}} | Unrealized PnL: <span class="${{pnlClass}}">${{pnlUsdt.toFixed(2)}} USDT</span> (ROE <span class="${{pnlClass}}">${{roeV.toFixed(2)}}%</span>)</div>
             <div>SL: ${{d.position.sl}} | TP1: ${{d.position.tp1}} | TP2: ${{d.position.tp2}}</div>
-            <div>TP1 done: ${{d.position.tp1_done}} | Trailing: ${{d.position.trailing_active}}</div>
+            <div>TP1: ${{d.position.tp1_done ? "done" : "pending"}} | Stage: <b>${{stage}}</b> | Protection: <b>${{prot}}</b></div>
+            <div><b>🎯 PROFIT PHASE (50/50):</b> Initial 100% | TP1 ${{Number(d.position.tp1_close_pct || 0).toFixed(0)}}% (<b>${{d.position.tp1_status || "WAITING"}}</b>) | Runner ${{Number(d.position.runner_pct || 0).toFixed(0)}}% <b>${{d.position.runner_status || "PENDING_TP1"}}</b> | TP2 remaining ${{Number(d.position.tp2_close_pct || 0).toFixed(1)}}% <b>${{d.position.tp2_status || "WAITING"}}</b></div>
+            <div><b>Profit Lock:</b> ${{d.position.profit_lock_active ? "ACTIVE" : "INACTIVE"}} | <b>Management:</b> ${{d.position.management_posture || "RIDE TREND"}}</div>
+            <div>Realized: <span class="${{rlzCls}}">${{rlzUsdt.toFixed(2)}} USDT (${{Number(d.position.realized_pnl_pct || 0).toFixed(2)}}%)</span> | Legs: ${{d.position.realized_legs || 0}} | TradeId: ${{d.position.trade_id || "-"}}</div>
             <div>Location: ${{d.position.location}} | Zone: ${{d.position.zone}}</div>
             <div>Narrative: ${{d.position.narrative_classification}} (Conf: ${{d.position.narrative_confidence}}) | Conf Level: ${{d.position.confidence_level}}</div>
             <div>Current Confidence: ${{d.position.current_confidence}} | Regime: ${{d.position.market_regime}} | Cont. Pressure: ${{d.position.continuation_pressure}}</div>
@@ -787,6 +728,24 @@ function updateUI(d) {{
     }} else {{
         document.getElementById("rf-live-panel").style.display = "none";
     }}
+    // === AI Market Intelligence ===
+    const ai = d.ai_market || {{mode:"SHADOW", items:[], active:null}};
+    const aiColor = (score) => Number(score||0) >= 82 ? "#00ffa6" : Number(score||0) >= 68 ? "#f1c40f" : "#e74c3c";
+    let aiHtml = `<div style="margin-bottom:8px;color:#9ca3af">Mode: <b style="color:#00ffa6">${{ai.mode||"SHADOW"}}</b> · execution remains under Strategy/Risk Gate</div>`;
+    if (ai.active && ai.active.score !== undefined) {{
+        const a = ai.active;
+        aiHtml += `<div style="padding:10px;border:1px solid #2c3e50;border-radius:10px;margin-bottom:10px;">
+          <b>${{a.symbol||"ACTIVE"}}</b> ${{a.side||""}} · AI Score <span style="color:${{aiColor(a.score)}};font-weight:800">${{Number(a.score||0).toFixed(1)}}</span> · Conf ${{Number(a.confidence||0).toFixed(1)}}% · ${{a.action||"WAIT"}}
+          <br>Zone: ${{Number((a.preferred_zone||{{}}).low||0).toFixed(4)}} — ${{Number((a.preferred_zone||{{}}).high||0).toFixed(4)}} · Invalidation: ${{Number((a.invalidation||{{}}).price||0).toFixed(4)}}
+          <br><small>${{(a.reasons||[]).join(" · ") || "No additional evidence"}}</small>
+        </div>`;
+    }}
+    const aiItems = ai.items || [];
+    aiHtml += aiItems.slice(0,12).map(a => `<div style="padding:7px 0;border-bottom:1px solid #1f2937;">
+      <b>${{a.symbol}}</b> <span style="color:${{a.side==="BUY"?"#00ffa6":"#ff4d4d"}}">${{a.side}}</span> · Score <b style="color:${{aiColor(a.score)}}">${{Number(a.score||0).toFixed(1)}}</b> · ${{a.action||"WAIT"}} · Zone ${{Number((a.preferred_zone||{{}}).low||0).toFixed(4)}}–${{Number((a.preferred_zone||{{}}).high||0).toFixed(4)}}
+      <small style="color:#9ca3af">${{(a.reasons||[]).slice(0,5).join(" · ")}}</small></div>`).join("");
+    document.getElementById("aiMarketPanel").innerHTML = aiHtml + (aiItems.length ? "" : "<div>No AI market candidates yet.</div>");
+
     if(d.continuation_probability) {{
         let color = d.continuation_probability >= 0.65 ? "green" : (d.continuation_probability >= 0.5 ? "yellow" : "red");
         document.getElementById("continuation-panel").innerHTML = `
@@ -813,16 +772,6 @@ function updateUI(d) {{
     document.getElementById("market_regime").innerHTML = d.market_regime || "UNKNOWN";
     document.getElementById("cont_pressure").innerHTML = d.continuation_pressure || 50;
     document.getElementById("thesis_failure").innerHTML = d.thesis_failure_score || 0;
-    const ms = d.market_state || {{}};
-    const me = ms.ema || {{}}; const mv = ms.vwap || {{}};
-    const ma = ms.accumulation || {{}}; const md = ms.distribution || {{}}; const mm = ms.microstructure || {{}};
-    document.getElementById("ms-state").innerText = `${{ms.state || "UNKNOWN"}} · ${{ms.transition_state || "UNKNOWN"}}`;
-    document.getElementById("ms-ema").innerText = `${{Number(me.ema50||0).toFixed(4)}} / ${{Number(me.ema200||0).toFixed(4)}} (${{me.cross_state||"-"}})`;
-    document.getElementById("ms-vwap").innerText = `${{mv.side||"-"}} · ${{Number(mv.value||0).toFixed(4)}}`;
-    document.getElementById("ms-acc").innerText = Number(ma.score||0).toFixed(1);
-    document.getElementById("ms-dist").innerText = Number(md.score||0).toFixed(1);
-    document.getElementById("ms-micro").innerText = mm.data_quality === "FRESH" ? `OB ${{mm.top_of_book_imbalance == null ? "-" : Number(mm.top_of_book_imbalance).toFixed(2)}}` : (mm.data_quality || "UNAVAILABLE");
-    document.getElementById("ms-reasons").innerText = `Market-state evidence: ${{(ms.reasons || []).join(" · ") || "-"}} | Data: ${{ms.data_quality || "UNKNOWN"}}`;
     document.getElementById("logs").innerHTML = (d.logs || []).slice(-15).join("<br>");
     document.getElementById("errors").innerHTML = (d.errors || []).slice(-5).join("<br>");
     let top5Html = "";
@@ -875,13 +824,7 @@ function updateUI(d) {{
                 const nc = {{NEWS_SUPPORT:"#2ecc71",NEWS_CONFLICT:"#e74c3c",NEWS_RISK:"#e74c3c",NEWS_NEUTRAL:"#95a5a6",NEWS_UNAVAILABLE:"#f1c40f"}}[w.news_state] || "#95a5a6";
                 extraInfo += ` | <span style="color:${{nc}}">${{w.news_state}}</span>`;
             }}
-            if (w.data_quality && w.data_quality !== "OK" && w.data_quality !== "ORDERBOOK_OK") extraInfo += ` | <span style="color:#f1c40f">DQ:${{w.data_quality}}</span>`;
-            if (w.orderbook_quality) {{
-                const oq = w.orderbook_quality;
-                if (oq.status && oq.status !== "ORDERBOOK_OK") extraInfo += ` | OB:${{oq.status}}`;
-                if (oq.cache_age !== null && oq.cache_age !== undefined) extraInfo += ` | OBage:${{oq.cache_age}}s`;
-                if (oq.reason) extraInfo += ` | OBreason:${{String(oq.reason).slice(0,90)}}`;
-            }}
+            if (w.data_quality && w.data_quality !== "OK") extraInfo += ` | <span style="color:#f1c40f">DQ:${{w.data_quality}}</span>`;
             if (w.zone_status && w.zone_status !== "OK") extraInfo += ` | <span style="color:#e74c3c">${{w.zone_status}}</span>`;
             if (w.zone) extraInfo += ` | Zone:${{w.zone.type}} @${{w.zone.price}} str=${{w.zone.strength}}`;
             if (w.analysis_age !== undefined) extraInfo += ` | Age:${{w.analysis_age}}s`;
@@ -1095,79 +1038,7 @@ async function loadDecision() {{
 setInterval(loadDecision, 6000);
 loadDecision();
 fetchData();
-// === BARON ADAPTIVE TRADE INTELLIGENCE ===
-async function loadAdaptiveTradeIntelligence() {{
-  try {{
-    const res = await fetch('/ai-learning', {{cache:'no-store'}});
-    const d = await res.json();
-    const s = d.summary || {{}};
-    const set = (id,v) => {{ const el=document.getElementById(id); if(el) el.innerText=v; }};
-    set('ai-total', s.total_trades || 0); set('ai-strong', s.strong_or_explosive || 0);
-    set('ai-explosive', Number(s.explosive_rate || 0).toFixed(1) + '%');
-    set('ai-peak', Number(s.avg_strong_peak_roe || 0).toFixed(1) + '%');
-    set('ai-realized', Number(s.avg_strong_realized_pct || 0).toFixed(2) + '%');
-    set('ai-status', s.status || 'LEARNING');
-    const assessment = (window.__baronData || {{}}).adaptive_trade_intelligence?.entry_assessment || {{}};
-    const live = document.getElementById('ai-live-diagnosis');
-    if (live) {{
-      if (assessment.label) {{
-        const cls = assessment.label === 'HISTORICALLY_WEAK' ? 'ai-weak' : assessment.label === 'HISTORICALLY_STRONG' ? 'ai-strong' : 'ai-neutral';
-        live.innerHTML = `<span class="ai-tag ${{cls}}">${{assessment.label}}</span> ${{assessment.message || ''}}<br><small>Samples: ${{assessment.samples || 0}} · Confidence: ${{Number(assessment.confidence || 0).toFixed(1)}}% · Advisory only</small>`;
-      }} else live.innerText = 'No historical diagnosis available for the current setup yet.';
-    }}
-    const pb = document.getElementById('ai-playbook');
-    if (pb) pb.innerHTML = (d.playbook || []).map(x => {{ const p=x.pattern||{{}}; return `<div class="ai-row"><span class="ai-tag ai-strong">${{x.explosive_share || 0}}% explosive</span><b>${{p.side||'-'}} · ${{p.ob_grade||'-'}} · ${{p.liquidity_event||'-'}}</b><br><small>${{p.market_regime||'-'}} · ${{p.move_maturity||'-'}} · ${{p.formation_verdict||'-'}} · ${{p.structure_shift||'-'}} · ${{p.vpa_state||'-'}} · Forecast:${{p.forecast_quality||'-'}} · n=${{x.samples}}</small></div>`; }}).join('') || 'Not enough repeated strong setups yet. The system will learn as verified trades accumulate.';
-    const rr = document.getElementById('ai-recent');
-    if (rr) rr.innerHTML = (d.recent || []).slice(0,12).map(x => {{ const cls=String(x.label||'').includes('WIN')?'ai-strong':(String(x.label||'').includes('LOSS')||x.label==='WEAK_ENTRY'?'ai-weak':'ai-neutral'); return `<div class="ai-row"><span class="ai-tag ${{cls}}">${{x.label||'UNKNOWN'}}</span><b>${{x.symbol||'-'}} ${{x.side||''}}</b> · PnL ${{Number(x.pnl_pct||0).toFixed(2)}}% · Peak ROE ${{Number(x.peak_roe||0).toFixed(1)}}%<br><small>${{x.exit_reason||'UNKNOWN'}} · ${{new Date(Number(x.recorded_at||0)*1000).toLocaleString()}}</small></div>`; }}).join('') || 'No completed trades recorded yet.';
-  }} catch(e) {{ console.error('Adaptive intelligence:', e); }}
-}}
-setInterval(loadAdaptiveTradeIntelligence, 6000);
-loadAdaptiveTradeIntelligence();
-
-// === BARON PROFESSIONAL INTELLIGENCE / TRADE LIFECYCLE ===
-async function loadProfessionalPanels() {{
-  try {{
-    const [tr, em] = await Promise.all([fetch('/trades'), fetch('/early-moves')]);
-    const trades = await tr.json(); const moves = await em.json();
-    const tp = document.getElementById('baron-trade-lifecycle');
-    const ep = document.getElementById('baron-early-moves');
-    if (tp) tp.innerHTML = (trades.items || []).slice(-12).reverse().map(x => `<div style="padding:6px;border-bottom:1px solid #222"><b>${{x.event}}</b> · ${{x.symbol}} · <small>${{x.trade_id || ''}}</small></div>`).join('') || 'No lifecycle events';
-    if (ep) ep.innerHTML = (moves.items || []).slice(0,10).map(x => `<div style="padding:7px;border-bottom:1px solid #222"><b>${{x.symbol}}</b> ${{x.side || ''}} · ${{x.maturity}} · Formation ${{Number(x.formation_score || 0).toFixed(1)}}<br><small>${{(x.evidence || []).join(' · ')}}</small></div>`).join('') || 'No emerging moves';
-  }} catch(e) {{ console.error(e); }}
-}}
-setInterval(loadProfessionalPanels, 6000);
-loadProfessionalPanels();
-
-// Institutional Setup Radar: read-only synthesis of the scanner evidence.
-async function loadInstitutionalSetupRadar() {{{{
-  try {{{{
-    const res = await fetch('/intelligence', {{cache:'no-store'}});
-    const d = await res.json();
-    const box = document.getElementById('institutionalSetupRadar');
-    if (!box) return;
-    const items = d.institutional_setups || [];
-    if (!items.length) {{{{ box.innerHTML = 'No institutional setup evidence yet.'; return; }}}}
-    box.innerHTML = items.slice(0,12).map(x => {{{{
-      const f=x.institutional_fusion||{{}};
-      const seq=f.sequence||{{}}; const loc=f.location||{{}}; const z=f.zone||{{}};
-      const state=f.state||'WATCH';
-      const cls=state==='CONFLICTED'?'red':(state==='EARLY_MOVE'||state==='CONFIRMED'?'green':'yellow');
-      const flags=[seq.liquidity_sweep?'SWEEP':'',seq.structure_shift?'MSS/BOS':'',seq.causal_zone?'OB':'',seq.retest?'RETEST':'',seq.vpa_confirmation?'VPA':''].filter(Boolean).join(' · ');
-      return `<div style="padding:9px 0;border-bottom:1px solid #1f2937;">
-        <div><b>${{x.symbol||'-'}}</b> · ${{x.side||'-'}} · <span class="${{cls}}">${{state}}</span> · Evidence ${{Number(f.evidence_score||0).toFixed(0)}}</div>
-        <div style="font-size:11px;color:#9ca3af;margin-top:3px">${{loc.role||'NEUTRAL_LOCATION'}} · OB ${{z.grade||'-'}} · ${{flags||'FORMING'}}</div>
-        <div style="font-size:11px;color:#9ca3af;margin-top:3px">${{f.explosive_candidate?'🔥 EARLY-EXPANSION CANDIDATE · ':''}}${{(f.contradictions||[]).join(' · ')||'No major contradiction'}}</div>
-      </div>`;
-    }}}}).join('');
-  }}}} catch(e) {{{{ console.error('Institutional setup radar:', e); }}}}
-}}}}
-setInterval(loadInstitutionalSetupRadar, 6000);
-loadInstitutionalSetupRadar();
 </script>
-<div style="padding:12px;display:grid;grid-template-columns:1fr 1fr;gap:14px;background:#07090d">
-  <div class="section smart-layer"><div class="title">🔥 BARON EARLY MOVES</div><div id="baron-early-moves" class="card" style="font-size:12px;max-height:300px;overflow:auto">Loading...</div></div>
-  <div class="section smart-layer"><div class="title">🧾 TRADE LIFECYCLE</div><div id="baron-trade-lifecycle" class="card" style="font-size:12px;max-height:300px;overflow:auto">Loading...</div></div>
-</div>
 </body></html>
 """
     return html
@@ -1188,37 +1059,81 @@ def data():
         DASHBOARD_STATE["account"]["mode"] = mode
         perf = get_dashboard_metrics()
         pos = DASHBOARD_STATE.get("position")
-        if STATE.get("open", False) and STATE.get("current_symbol") and pos is None:
-            roe = STATE.get("roe_pct", 0.0)
-            pos = {
-                "symbol": STATE["current_symbol"],
-                "side": STATE["side"],
-                "entry": round(STATE["entry"],4),
-                "qty": STATE.get("qty", 0),
-                "pnl": round(roe, 2),
-                "sl": round(STATE.get("synthetic_sl",0),4),
-                "tp1": round(STATE.get("synthetic_tp1",0),4),
-                "tp2": round(STATE.get("tp2_price",0),4),
-                "tp1_done": STATE.get("tp1_hit", False),
-                "trailing_active": STATE.get("trail_activated", False),
-                "regime": MEMORY.get("regime", "UNKNOWN"),
-                "trade_type": STATE.get("trade_type"),
-                "entry_type": STATE.get("entry_type"),
-                "classification": STATE.get("classification"),
-                "location": STATE.get("location"),
-                "zone": STATE.get("zone_info"),
-                "score": STATE.get("trade_score", 0),
-                "narrative_classification": STATE.get("narrative_classification"),
-                "narrative_confidence": STATE.get("narrative_confidence", 0.0),
-                "confidence_level": STATE.get("confidence_level"),
-                "current_confidence": STATE.get("current_confidence", 50.0),
-                "market_regime": STATE.get("market_regime", "UNKNOWN"),
-                "continuation_pressure": STATE.get("continuation_pressure", 50),
-                "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
-                "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
-                "delay_tp1": STATE.get("delay_tp1", False)
-            }
-        health = dict(MEMORY.get("health", {}))
+        if STATE["open"] and STATE.get("current_symbol") and pos is None:
+            # P1-4: build the position through the canonical payload so realized
+            # vs unrealized stay separate and every documented key is present.
+            try:
+                if _canonical_pos_payload is not None:
+                    pos = _canonical_pos_payload(STATE["current_symbol"], STATE)
+            except Exception:
+                pos = None
+            if pos is None:
+                # Last-resort legacy projection (pnl is USDT, roe is the %).
+                roe = STATE.get("roe_pct", 0.0)
+                pos = {
+                    "symbol": STATE["current_symbol"],
+                    "side": STATE["side"],
+                    "entry": round(STATE["entry"],4),
+                    "qty": STATE["qty"],
+                    "pnl": round(STATE.get("unrealized_pnl_usdt", 0.0), 2),
+                    "roe": round(roe, 2),
+                    "roe_pct": round(roe, 2),
+                    "realized_pnl_usdt": round(STATE.get("realized_pnl_usdt", 0.0), 2),
+                    "realized_pnl_pct": round(STATE.get("realized_pnl_pct", 0.0), 2),
+                    "realized_legs": int(STATE.get("realized_legs", 0) or 0),
+                    "profit_stage": STATE.get("profit_stage"),
+                    "protection_state": STATE.get("protection_state"),
+                    "trade_id": STATE.get("trade_id"),
+                    "sl": round(STATE.get("synthetic_sl",0),4),
+                    "tp1": round(STATE.get("synthetic_tp1",0),4),
+                    "tp2": round(STATE.get("tp2_price",0),4),
+                    "tp1_done": STATE.get("tp1_hit", False),
+                    "tp1_hit": STATE.get("tp1_hit", False),
+                    "tp1_close_pct": round(float(STATE.get("tp1_ratio", 0.5) or 0.5) * 100.0, 2),
+                    "tp1_status": "DONE" if str(STATE.get("tp1_state", "")).upper() == "EXECUTED" else "WAITING",
+                    "runner_pct": round((1.0 - float(STATE.get("tp1_ratio", 0.5) or 0.5)) * 100.0, 2),
+                    "runner_status": ("DONE" if float(STATE.get("remaining_qty", 0.0) or 0.0) <= 0
+                                      else "ACTIVE") if str(STATE.get("tp1_state", "")).upper() == "EXECUTED"
+                                      else "PENDING_TP1",
+                    "runner_active": bool(str(STATE.get("tp1_state", "")).upper() == "EXECUTED"
+                                          and float(STATE.get("remaining_qty", 0.0) or 0.0) > 0),
+                    "tp2_close_pct": round(
+                        ((float(STATE.get("remaining_qty", 0.0) or 0.0)
+                          / float(STATE.get("qty_initial") or 1.0)) * 100.0)
+                        if float(STATE.get("qty_initial") or 0.0) > 0 else 0.0, 2),
+                    "tp2_status": ("DONE" if str(STATE.get("tp2_state", "")).upper() == "EXECUTED"
+                                   else "ACTIVE") if (str(STATE.get("tp1_state", "")).upper() == "EXECUTED"
+                                                      and float(STATE.get("remaining_qty", 0.0) or 0.0) > 0)
+                                   else "WAITING",
+                    "profit_lock_active": bool(
+                        str(STATE.get("protection_state", "")).upper() in ("PROFIT_LOCK", "TRAILING")
+                        or STATE.get("profit_lock_activated", False)
+                        or STATE.get("trail_activated", False)),
+                    "management_posture": (
+                        "EXIT" if STATE.get("exit_warning") or STATE.get("thesis_failure_score", 0) >= 60
+                        else "PROTECT" if (str(STATE.get("protection_state", "")).upper() in ("PROFIT_LOCK", "TRAILING")
+                                           or STATE.get("exit_warning"))
+                        else "RIDE TREND"),
+                    "initial_size": float(STATE.get("qty_initial") or STATE.get("qty") or 0.0),
+                    "trailing_active": STATE.get("trail_activated", False),
+                    "regime": MEMORY.get("regime", "UNKNOWN"),
+                    "trade_type": STATE.get("trade_type"),
+                    "entry_type": STATE.get("entry_type"),
+                    "classification": STATE.get("classification"),
+                    "location": STATE.get("location"),
+                    "zone": STATE.get("zone_info"),
+                    "score": STATE.get("trade_score", 0),
+                    "narrative_classification": STATE.get("narrative_classification"),
+                    "narrative_confidence": STATE.get("narrative_confidence", 0.0),
+                    "confidence_level": STATE.get("confidence_level"),
+                    "current_confidence": STATE.get("current_confidence", 50.0),
+                    "market_regime": STATE.get("market_regime", "UNKNOWN"),
+                    "continuation_pressure": STATE.get("continuation_pressure", 50),
+                    "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
+                    "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
+                    "delay_tp1": STATE.get("delay_tp1", False)
+                }
+        health = MEMORY["health"].copy()
         health["errors"] = len(DASHBOARD_STATE["errors"])
         top5 = MEMORY.get("top_candidates", [])[:5] if "top_candidates" in MEMORY else []
         # Read-only route: watchlist lifecycle cleanup runs exclusively in the
@@ -1250,7 +1165,7 @@ def data():
                 "unrealized_pnl": STATE.get("unrealized_pnl_usdt", 0),
                 "roe_pct": STATE.get("roe_pct", 0),
                 "liquidation_price": STATE.get("liquidation_price", 0),
-                "position_size": STATE.get("qty", 0),
+                "position_size": STATE["qty"],
                 "leverage": LEVERAGE,
                 "tp1_hit": STATE.get("tp1_hit", False),
                 "tp2_hit": STATE.get("tp2_hit", False),
@@ -1267,7 +1182,14 @@ def data():
                 "reclaim_risk": STATE.get("reclaim_risk", 0),
                 "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
                 "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
-                "delay_tp1": STATE.get("delay_tp1", False)
+                "delay_tp1": STATE.get("delay_tp1", False),
+                "trade_id": STATE.get("trade_id"),
+                "profit_stage": STATE.get("profit_stage"),
+                "protection_state": STATE.get("protection_state"),
+                "position_status": STATE.get("position_status"),
+                "realized_pnl_usdt": STATE.get("realized_pnl_usdt", 0),
+                "realized_pnl_pct": STATE.get("realized_pnl_pct", 0),
+                "realized_legs": int(STATE.get("realized_legs", 0) or 0)
             }
             live_data["live_trade_mode"] = True
             live_data["supervisor"] = supervisor_data
@@ -1345,8 +1267,7 @@ def data():
                 "trades": E.PERF.get("trades", 0),
                 "wins": E.PERF.get("wins", 0),
                 "losses": E.PERF.get("losses", 0),
-                "win_rate": (E.PERF.get("wins", 0) / E.PERF.get("trades", 0) * 100)
-                            if E.PERF.get("trades", 0) else 0.0,
+                "win_rate": (E.PERF.get("wins", 0) / E.PERF.get("trades", 0) * 100) if E.PERF.get("trades", 0) else 0.0,
             },
             "position": pos,
             "positions": DASHBOARD_STATE.get("positions", []),
@@ -1371,22 +1292,33 @@ def data():
              "watchlist_active": int(MEMORY.get("watchlist_active", len(MEMORY.get("watchlist", {})))),
              "watchlist_deep_analyzed": int(MEMORY.get("watchlist_deep_analyzed", 0)),
              "watchlist_cycle_id": int(MEMORY.get("watchlist_cycle_id", 0)),
-            "last_scan": MEMORY.get("last_scan", 0),
-            "regime": MEMORY.get("regime", "UNKNOWN"),
+            "last_scan": MEMORY["last_scan"],
+            "regime": MEMORY["regime"],
             "health": health,
             "rf_dashboard": MEMORY.get("rf_dashboard", [])[:20],
             "total_pnl": perf["total_pnl"],
             "total_pnl_usdt": perf["total_pnl_usdt"],
             "last_trade": perf["last_trade"],
+            # P1-4 profit summary: realized (banked) vs unrealized (floating)
+            # are reported independently, never blended.
+            "profit_summary": {
+                "realized_pnl_usdt": round(float(STATE.get("realized_pnl_usdt", 0.0) or 0.0), 2),
+                "realized_pnl_pct": round(float(STATE.get("realized_pnl_pct", 0.0) or 0.0), 2),
+                "realized_roe_pct": round(float(STATE.get("realized_roe_pct", 0.0) or 0.0), 2),
+                "realized_legs": int(STATE.get("realized_legs", 0) or 0),
+                "unrealized_pnl_usdt": round(float(STATE.get("unrealized_pnl_usdt", 0.0) or 0.0), 2),
+                "unrealized_roe_pct": round(float(STATE.get("roe_pct", 0.0) or 0.0), 2),
+                "profit_stage": STATE.get("profit_stage"),
+                "protection_state": STATE.get("protection_state"),
+                "last_trade": STATE.get("last_trade_summary")
+                            if isinstance(STATE.get("last_trade_summary"), dict) else None,
+            },
             "scanner_v2_buy": MEMORY.get("scanner_v2_buy", []),
             "scanner_v2_sell": MEMORY.get("scanner_v2_sell", []),
             "watchlist": watchlist_data,
             "institutional_zone_analysis": list((MEMORY.get("institutional_zone_analysis") or {}).values()),
             "institutional_zone_count": int(MEMORY.get("institutional_zone_count", 0)),
             "no_entry_feed": no_entry_feed,
-            "trade_lifecycle": safe_json(_normalize_payload((getattr(E, "_TRADE_JOURNAL", None).tail(50) if getattr(E, "_TRADE_JOURNAL", None) is not None else DASHBOARD_STATE.get("trade_lifecycle", [])))),
-            "early_moves": safe_json(_normalize_payload(MEMORY.get("early_moves", []))),
-            "market_intelligence": safe_json(_normalize_payload(DASHBOARD_STATE.get("market_intelligence", {}))),
             "continuation_probability": STATE.get("continuation_probability", 0.5),
             "hold_quality": STATE.get("hold_quality", "UNKNOWN"),
             "counter_pressure": STATE.get("counter_pressure", 0.0),
@@ -1396,18 +1328,22 @@ def data():
             "trade_thesis": STATE.get("trade_thesis", {}),
             "current_confidence": STATE.get("current_confidence", 50.0),
             "market_regime": STATE.get("market_regime", "UNKNOWN"),
-            "market_state": safe_json(_normalize_payload(MEMORY.get("market_state", {}))),
             "continuation_pressure": STATE.get("continuation_pressure", 50),
             "thesis_failure_score": STATE.get("thesis_failure_score", 0),
             "institutional_flow": institutional_flow_data,
             "last_live_refresh": DASHBOARD_STATE.get("last_live_refresh", time.time()),
             "intent_engine": intent_data,
             "dynamic_trade": dynamic_trade_data,
-            "adaptive_trade_intelligence": {
-                "entry_assessment": safe_json(_normalize_payload(STATE.get("adaptive_entry_assessment", {}))),
-                "outcome": safe_json(_normalize_payload(STATE.get("adaptive_outcome", {}))),
-            },
             "allocation": MEMORY.get("portfolio_allocation", None),
+            "ai_market": {
+                "mode": str(os.getenv("AI_MARKET_MODE", "SHADOW")).upper(),
+                "active": STATE.get("ai_market", {}) if STATE.get("open") else None,
+                "items": sorted([
+                    {**(w.get("ai_market") or {}), "symbol": sym}
+                    for sym, w in watchlist_data.items()
+                    if isinstance(w, dict) and isinstance(w.get("ai_market"), dict)
+                ], key=lambda x: float(x.get("score", 0) or 0), reverse=True)[:20]
+            },
             **live_data
         }
         # Add queue status
@@ -1505,6 +1441,22 @@ def radar_endpoint():
     radar = MEMORY.get("deep_radar", MEMORY.get("radar_top5", []))
     return jsonify({"status": "OK", "count": len(radar), "items": safe_json(radar[:50])}), 200
 
+@app.route("/ai")
+def ai_endpoint():
+    mode = str(os.getenv("AI_MARKET_MODE", "SHADOW")).upper()
+    items = []
+    for sym, item in (MEMORY.get("watchlist", {}) or {}).items():
+        if not isinstance(item, dict):
+            continue
+        ai = item.get("ai_market")
+        if isinstance(ai, dict) and ai.get("score") is not None:
+            row = dict(ai)
+            row["symbol"] = sym
+            items.append(row)
+    items.sort(key=lambda x: float(x.get("score", 0) or 0), reverse=True)
+    active = STATE.get("ai_market") if STATE.get("open") else None
+    return jsonify({"status":"OK", "mode":mode, "active":safe_json(active or {}), "count":len(items), "items":safe_json(items[:50])}), 200
+
 @app.route("/metrics")
 def metrics_endpoint():
     return jsonify({"status": "OK", "stats": safe_json(DASHBOARD_STATE.get("stats", {})),
@@ -1558,72 +1510,10 @@ def manual_close():
     closed = sum(1 for sym in targets if PORTFOLIO.close_symbol(sym))
     return jsonify({"message": f"Closed {closed} position(s)"}), 200
 
-@app.route("/trades")
-def trades_endpoint():
-    """Read-only durable trade lifecycle feed; never mutates trade state."""
-    try:
-        journal = getattr(E, "_TRADE_JOURNAL", None)
-        items = journal.tail(100) if journal is not None else list(DASHBOARD_STATE.get("trade_lifecycle", []))[-100:]
-        return jsonify({"status":"OK","count":len(items),"items":safe_json(_normalize_payload(items))}), 200
-    except Exception as exc:
-        return jsonify({"status":"DEGRADED","error":str(exc),"items":[]}), 200
-
-@app.route("/intelligence")
-def intelligence_endpoint():
-    watch = MEMORY.get("watchlist", {}) or {}
-    if isinstance(watch, dict):
-        setups = list(watch.values())
-    else:
-        setups = list(watch or [])
-    setups = [x for x in setups if isinstance(x, dict) and x.get("institutional_fusion")]
-    setups.sort(key=lambda x: float((x.get("institutional_fusion") or {}).get("evidence_score", 0) or 0), reverse=True)
-    return jsonify({"status":"OK",
-                    "early_moves":safe_json(_normalize_payload(MEMORY.get("early_moves", []))),
-                    "quality":MEMORY.get("market_data_quality","UNKNOWN"),
-                    "institutional_flow":safe_json(_normalize_payload(MEMORY.get("institutional_flow", {}))),
-                    "institutional_setups":safe_json(_normalize_payload(setups[:30])),
-                    "news_reaction":safe_json(_normalize_payload(DASHBOARD_STATE.get("news_reaction", {})))}), 200
-
-@app.route("/early-moves")
-def early_moves_endpoint():
-    items=MEMORY.get("early_moves", []) or []
-    return jsonify({"status":"OK","count":len(items),"items":safe_json(_normalize_payload(items))}), 200
-
-@app.route("/data-fabric")
-def data_fabric_endpoint():
-    """Read-only OpenBB-inspired normalized evidence view."""
-    try:
-        args = getattr(request, "args", None)
-        symbol = str((args.get("symbol") if args is not None else None) or STATE.get("current_symbol") or "")
-        fabric = getattr(E, "_DATA_FABRIC", None)
-        if fabric is None:
-            return jsonify({"status": "DISABLED", "symbol": symbol, "providers": [], "snapshot": {}}), 200
-        return jsonify({"status": "OK", "symbol": symbol, "providers": list(fabric.registry.names()),
-                        "snapshot": safe_json(_normalize_payload(fabric.snapshot(symbol)))}) , 200
-    except Exception as exc:
-        return jsonify({"status":"DEGRADED","error":str(exc)}), 200
-
-@app.route("/ai-learning")
-def ai_learning_endpoint():
-    """Read-only adaptive trade intelligence view for the dashboard."""
-    try:
-        ati = getattr(E, "GLOBAL_ADAPTIVE_TRADE_INTELLIGENCE", None)
-        if ati is None:
-            return jsonify({"status": "DISABLED", "summary": {}, "playbook": [], "recent": []}), 200
-        return jsonify({
-            "status": "OK",
-            "summary": safe_json(_normalize_payload(ati.summary())),
-            "playbook": safe_json(_normalize_payload(ati.playbook(12))),
-            "recent": safe_json(_normalize_payload(ati.recent(20))),
-        }), 200
-    except Exception as exc:
-        return jsonify({"status": "DEGRADED", "error": str(exc), "summary": {}, "playbook": [], "recent": []}), 200
-
 @app.route("/health")
 def health():
     health_state = MEMORY.get("health", {}) or {}
     queue_state = "HEALTHY" if USE_EXECUTION_QUEUE else "DISABLED"
-    np = DASHBOARD_STATE.get("native_protection", {})
     return jsonify({
         "ok": True,
         "overall_status": health_state.get("status", "RUNNING"),
@@ -1635,12 +1525,6 @@ def health():
         "execution_status": "LIVE" if MODE_LIVE else "PAPER",
         "dashboard_status": "HEALTHY",
         "queue_status": queue_state,
-        "native_protection": {
-            "status": np.get("status", "MISSING"),
-            "manager": np.get("manager", "MISSING"),
-            "live_entry": np.get("live_entry", "UNKNOWN"),
-            "reason": np.get("reason", ""),
-        },
         "errors": int(health_state.get("errors", 0) or 0),
     }), 200
 
