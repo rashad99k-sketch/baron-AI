@@ -1562,10 +1562,9 @@ class DeepScanner:
             self.watch_cursor = 0
 
         # Continuous coverage with priority escalation.  Every active watchlist
-        # symbol gets a freshness deadline; MEDIUM/STRONG rows are always placed
-        # first on the next pass, while stale/never-analyzed rows outrank normal
-        # rotation.  The worker pool shortens the 60-symbol coverage window without
-        # changing the per-symbol analysis logic or execution authority.
+        # symbol gets a freshness deadline; stale/never-analyzed rows outrank
+        # normal rotation.  The worker pool shortens the 60-symbol coverage window
+        # without changing the per-symbol analysis logic or execution authority.
         now = time.time()
         def _priority(sym):
             row = watch.get(sym, {}) or {}
@@ -1574,7 +1573,9 @@ class DeepScanner:
             never = 1 if not row.get("deep_analyzed") else 0
             urgent = 3 if strength == "STRONG" else (2 if strength == "MEDIUM" else 0)
             stale = 1 if age >= self.watch_max_age else 0
-            return (urgent, stale, never, age)
+            # Priority order (reverse sort): stale > never > urgent > age
+            # This ensures stale/never-analyzed rows are analyzed first.
+            return (stale, never, urgent, age)
 
         ordered = sorted(self.watch_symbols, key=_priority, reverse=True)
         target_batch = min(self.watch_batch_size, len(ordered))
