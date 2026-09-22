@@ -593,6 +593,7 @@ class DeepScanner:
                 "news": {"available": False, "risk": 0, "bias": "NEUTRAL", "headlines": []},
                 "cycle_id": self.cycle_id,
                 "last_update": now,
+                "watchlist_entry_time": now,
             }
 
         E.MEMORY["watchlist"] = active
@@ -1481,6 +1482,7 @@ class DeepScanner:
                     )
                 except Exception:
                     pass
+            entry["institutional_analysis_time"] = time.time()
             self._institutional_bridge(sym, entry, score, precursor_evidence, strength)
             return entry
         except Exception as exc:
